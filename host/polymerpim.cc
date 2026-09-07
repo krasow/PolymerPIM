@@ -45,6 +45,8 @@ struct Node {
   size_t ops = 0;
   // Cached RPN stack depth this subtree needs to evaluate.
   size_t stack_depth = 0;
+  // Upper bound on distinct inputs; shared vectors are counted once per use.
+  size_t input_count = 0;
   std::vector<std::shared_ptr<Node>> children;
 };
 
@@ -56,6 +58,10 @@ NodeRef node(ExprOp op, std::vector<NodeRef> children = {}) {
   result->ops = (op == ExprOp::input || op == ExprOp::scalar) ? 0 : 1;
   for (const auto& child : children) {
     if (child) result->ops += child->ops;
+  }
+  result->input_count = (op == ExprOp::input) ? 1 : 0;
+  for (const auto& child : children) {
+    if (child) result->input_count += child->input_count;
   }
   // Child i sits above i already-pushed slots.
   result->stack_depth = 1;
@@ -124,6 +130,11 @@ size_t expression_ops(const NodeRef& value) { return value ? value->ops : 0; }
 // RPN stack slots needed; past the interpreter's stack it cannot run at all.
 size_t expression_depth(const NodeRef& value) {
   return value ? value->stack_depth : 0;
+}
+
+// Deferring past the input budget makes lowering throw; materialise instead.
+size_t expression_inputs(const NodeRef& value) {
+  return value ? value->input_count : 0;
 }
 
 uint8_t scalar_opcode(ExprOp op) {
@@ -464,6 +475,7 @@ struct DPUVector<T>::Impl {
       pending->children.clear();
       pending->ops = 0;
       pending->stack_depth = 1;
+      pending->input_count = 1;
     }
     pending = nullptr;
     return value;
@@ -615,7 +627,8 @@ DPUVector<T>::operator DpuLazy<T>() const {
   // mints another program shape for the JIT to compile.
   if (impl_->pending && !impl_->consumed &&
       expression_ops(impl_->pending) < MAX_VFUSE_OPS &&
-      expression_depth(impl_->pending) <= MAX_PIPELINE_STACK_DEPTH) {
+      expression_depth(impl_->pending) <= MAX_PIPELINE_STACK_DEPTH &&
+      expression_inputs(impl_->pending) < MAX_COMBINED_INPUTS) {
     impl_->consumed = true;
     return DpuLazy<T>(std::make_shared<DpuLazy<T>::Impl>(impl_->pending));
   }
