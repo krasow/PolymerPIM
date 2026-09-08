@@ -18,13 +18,15 @@ JIT_BATCH_SIZE ?= 16
 # how many pending queue events to scan ahead when looking for fusion candidates
 FUSION_LOOKAHEAD ?= 32
 # horizontal fusion: max independent parallel chains per kernel pass
-MAX_HFUSE_CHAINS ?= 10
+MAX_HFUSE_CHAINS ?= 9
 # vertical fusion: max RPN opcodes per chain (caps how deep chains can be fused)
 MAX_VFUSE_OPS ?= 128
 # vertical fusion: max distinct input vectors referenced per kernel
 MAX_VFUSE_INPUTS ?= 11
 # vertical fusion: max live WRAM stack vectors used by the generic pipeline interpreter
-MAX_PIPELINE_STACK_DEPTH ?= 2
+# 3 lets the interpreter run depth-3 updates, so the hybrid fallback
+# engages instead of blocking on the compiler; costs one hfuse chain.
+MAX_PIPELINE_STACK_DEPTH ?= 3
 # DPU WRAM tile size is 2^BLOCK_SIZE_LOG2 elements per tasklet block
 BLOCK_SIZE_LOG2 ?= 4
 

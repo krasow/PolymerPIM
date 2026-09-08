@@ -43,7 +43,7 @@ const SAMPLE_APP_TIME =
         @test run["min"] == "3.1"
         @test run["max"] == "3.4"
         @test [run[knob] for knob in BenchmarkRunner.FUSION_BUILD_KNOBS] ==
-              ["128", "10", "16", "128", "11", "4"]
+              ["128", "9", "16", "128", "11", "4"]
 
         sections = csv_records(BenchmarkRunner.sections_csv(path))
         @test length(sections) == 4

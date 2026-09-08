@@ -1,6 +1,6 @@
 const DEFAULT_FUSION_BUILD = Dict(
     "FUSION_LOOKAHEAD" => 128,
-    "MAX_HFUSE_CHAINS" => 10,
+    "MAX_HFUSE_CHAINS" => 9,
     "JIT_BATCH_SIZE" => 16,
     "MAX_VFUSE_OPS" => 128,
     "MAX_VFUSE_INPUTS" => 11,
@@ -9,7 +9,8 @@ const DEFAULT_FUSION_BUILD = Dict(
 
 const DEFAULT_FUSION_SEARCH = Dict(
     "FUSION_LOOKAHEAD" => [0, 1, 2, 4, 8, 16, 32, 64, 128],
-    "MAX_HFUSE_CHAINS" => [1, 2, 4, 6, 8, 10],
+    # 9 is the ceiling: a tenth chain overflows WRAM at stack depth 3.
+    "MAX_HFUSE_CHAINS" => [1, 2, 4, 6, 8, 9],
     "JIT_BATCH_SIZE" => [0, 1, 2, 4, 8, 16, 32],
     "MAX_VFUSE_OPS" => [1, 8, 16, 32, 64, 96, 128, 192],
 )
@@ -494,6 +495,15 @@ function tune_target(config::RunnerConfig, spec::BenchmarkSpec, options::TuneOpt
     end
 
     seed = copy(DEFAULT_FUSION_BUILD)
+    # The seed must be buildable: vector_search at dim=16 needs 16 inputs.
+    if !isempty(options.workspace_profiles)
+        seed["MAX_VFUSE_INPUTS"], seed["BLOCK_SIZE_LOG2"] =
+            options.workspace_profiles[1]
+    end
+    for (knob, candidates) in options.search
+        haskey(seed, knob) && !(seed[knob] in candidates) &&
+            (seed[knob] = maximum(candidates))
+    end
     initial = evaluate(seed)
     record!(checkpoint, seed, initial, "initial", "", "")
     isfinite(initial.objective) || error("initial configuration failed for $(spec.name)")
