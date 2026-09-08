@@ -423,6 +423,15 @@ void EventQueue::finalize_finished_events() {
   std::lock_guard<std::recursive_mutex> lock(mtx_);
   while (!running_events_.empty() && running_events_.front()->finished) {
     auto e = running_events_.front();
+    // A reduction result is terminal -- the host reads it, nothing re-derives
+    // it -- so once the reduce has run its absorbed input list is dead weight.
+    // Holding it keeps every full-length intermediate alive for as long as the
+    // caller keeps the future, which a batch of reductions cannot afford.
+    if (e->output && e->output->is_reduction_result) {
+      e->output->absorbed_inputs.clear();
+      e->output->absorbed_rpn.clear();
+      e->output->absorbed_scalars.clear();
+    }
     last_finished_id_.store(e->max_id);
     trace::execution_end();
     running_events_.pop_front();

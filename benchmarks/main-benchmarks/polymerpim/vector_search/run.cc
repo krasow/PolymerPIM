@@ -11,12 +11,6 @@
 
 using namespace polymerpim;
 
-/* Cap queries in flight: unfused scores are held until sync, so an unbounded
-   batch scales MRAM with `iterations`. */
-#ifndef QUERIES_IN_FLIGHT
-#define QUERIES_IN_FLIGHT 8
-#endif
-
 static vector_search_result_t cpu_best(const std::vector<T> &query) {
   vector_search_result_t result;
   vector_search_result_init(&result);
@@ -96,44 +90,38 @@ int main() {
 
     auto run_queries = [&](uint32_t count, BenchStages &query_stages) {
       std::vector<DpuFuture<ArgResult>> pending;
-      pending.reserve(QUERIES_IN_FLIGHT);
+      pending.reserve(count);
       vector_search_result_t global;
       vector_search_result_init(&global);
 
-      for (uint32_t base = 0; base < count; base += QUERIES_IN_FLIGHT) {
-        const uint32_t chunk =
-            std::min<uint32_t>(QUERIES_IN_FLIGHT, count - base);
-        pending.clear();
-
-        for (uint32_t q = 0; q < chunk; ++q) {
-          bench_stage_begin(&query_stages, BENCH_STAGE_WRITE);
-          for (uint32_t d = 0; d < DIM; ++d) {
-            query[d] = vector_search_query_value(seed, query_id, d);
-          }
-          ++query_id;
-          bench_stage_end(&query_stages);
-
-          bench_stage_begin(&query_stages, BENCH_STAGE_KERNEL);
-          DPUVector<T> score(columns[0].size());
-          for (uint32_t d = 0; d < DIM; ++d) {
-            score = score + columns[d] * query[d];
-          }
-          pending.push_back(argmax(score));
-          bench_stage_end(&query_stages);
+      for (uint32_t q = 0; q < count; ++q) {
+        bench_stage_begin(&query_stages, BENCH_STAGE_WRITE);
+        for (uint32_t d = 0; d < DIM; ++d) {
+          query[d] = vector_search_query_value(seed, query_id, d);
         }
+        ++query_id;
+        bench_stage_end(&query_stages);
 
         bench_stage_begin(&query_stages, BENCH_STAGE_KERNEL);
-        sync();
-        bench_stage_end(&query_stages);
-
-        bench_stage_begin(&query_stages, BENCH_STAGE_READ);
-        for (auto &future : pending) {
-          const auto best = future.get();
-          global.score = best.value;
-          global.index = best.index;
+        DPUVector<T> score(columns[0].size());
+        for (uint32_t d = 0; d < DIM; ++d) {
+          score = score + columns[d] * query[d];
         }
+        pending.push_back(argmax(score));
         bench_stage_end(&query_stages);
       }
+
+      bench_stage_begin(&query_stages, BENCH_STAGE_KERNEL);
+      sync();
+      bench_stage_end(&query_stages);
+
+      bench_stage_begin(&query_stages, BENCH_STAGE_READ);
+      for (auto &future : pending) {
+        const auto best = future.get();
+        global.score = best.value;
+        global.index = best.index;
+      }
+      bench_stage_end(&query_stages);
       return global;
     };
 
