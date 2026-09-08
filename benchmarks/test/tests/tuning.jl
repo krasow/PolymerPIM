@@ -1,6 +1,7 @@
 @testset "fusion search" begin
+    # 9 is the ceiling: a tenth chain overflows WRAM at stack depth 3.
     @test BenchmarkRunner.DEFAULT_FUSION_SEARCH["MAX_HFUSE_CHAINS"] ==
-          [1, 2, 4, 6, 8, 10]
+          [1, 2, 4, 6, 8, 9]
     seed = copy(BenchmarkRunner.DEFAULT_FUSION_BUILD)
     search = Dict(knob => [value] for (knob, value) in seed)
     search["FUSION_LOOKAHEAD"] = [1, 2, 3]
