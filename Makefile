@@ -16,7 +16,7 @@ JIT_PIPELINE_FALLBACK ?= 0
 # how many unique kernels to batch before triggering a JIT compile
 JIT_BATCH_SIZE ?= 16
 # how many pending queue events to scan ahead when looking for fusion candidates
-FUSION_LOOKAHEAD ?= 32
+QUEUE_ABSORB_LIMIT ?= 32
 # horizontal fusion: max independent parallel chains per kernel pass
 MAX_HFUSE_CHAINS ?= 9
 # vertical fusion: max RPN opcodes per chain (caps how deep chains can be fused)
@@ -176,7 +176,7 @@ reconfigure:
 	@echo "PERFETTO_HOME=$(PERFETTO_HOME)" >> $(CONFIG_STAMP)
 	@echo "DEBUG_KEEP_JIT_DIR=$(DEBUG_KEEP_JIT_DIR)" >> $(CONFIG_STAMP)
 	@echo "ENABLE_PROMOTION_REDUCTIONS=$(ENABLE_PROMOTION_REDUCTIONS)" >> $(CONFIG_STAMP)
-	@echo "FUSION_LOOKAHEAD=$(FUSION_LOOKAHEAD)" >> $(CONFIG_STAMP)
+	@echo "QUEUE_ABSORB_LIMIT=$(QUEUE_ABSORB_LIMIT)" >> $(CONFIG_STAMP)
 	@echo "ENABLE_OOM_RECOVERY=1" >> $(CONFIG_STAMP)
 	@echo "MAX_HFUSE_CHAINS=$(MAX_HFUSE_CHAINS)" >> $(CONFIG_STAMP)
 	@echo "MAX_VFUSE_OPS=$(MAX_VFUSE_OPS)" >> $(CONFIG_STAMP)

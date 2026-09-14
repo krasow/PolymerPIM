@@ -217,7 +217,7 @@ constexpr size_t max_reduction_chains() {
 constexpr size_t max_hfuse_chains() { return (size_t)MAX_HFUSE_CHAINS; }
 constexpr size_t max_combined_inputs() { return (size_t)MAX_COMBINED_INPUTS; }
 constexpr size_t max_vfuse_ops() { return (size_t)MAX_VFUSE_OPS; }
-constexpr size_t fusion_lookahead() { return (size_t)FUSION_LOOKAHEAD; }
+constexpr size_t queue_absorb_limit() { return (size_t)QUEUE_ABSORB_LIMIT; }
 
 // Turns a limit into an expected kernel count.
 constexpr size_t ceil_div(size_t a, size_t b) { return (a + b - 1) / b; }

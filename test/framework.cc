@@ -169,7 +169,7 @@ void print_build_config() {
             << " MAX_VFUSE_OPS=" << MAX_VFUSE_OPS
             << " MAX_VFUSE_INPUTS=" << MAX_VFUSE_INPUTS
             << "\n       MAX_PIPELINE_STACK_DEPTH=" << MAX_PIPELINE_STACK_DEPTH
-            << " FUSION_LOOKAHEAD=" << FUSION_LOOKAHEAD
+            << " QUEUE_ABSORB_LIMIT=" << QUEUE_ABSORB_LIMIT
             << " BLOCK_SIZE=" << BLOCK_SIZE << " NR_TASKLETS=" << NR_TASKLETS
             << "\n";
 }

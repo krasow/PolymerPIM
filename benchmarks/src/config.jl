@@ -112,7 +112,7 @@ struct FusionProfile
 end
 
 const FUSION_BUILD_KNOBS = (
-    "FUSION_LOOKAHEAD",
+    "QUEUE_ABSORB_LIMIT",
     "MAX_HFUSE_CHAINS",
     "JIT_BATCH_SIZE",
     "MAX_VFUSE_OPS",
