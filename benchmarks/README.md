@@ -73,7 +73,8 @@ Runs use `/usr/bin/time`. Failures are recorded and do not stop the suite.
 Generated results, parameters, binaries, and reference data are untracked.
 
 ```bash
-./plot_paper_figures.sh                # every figure in the paper
+./run_paper_results.sh                 # run every benchmark the paper needs
+./plot_paper_figures.sh                # plot every paper figure
 python3 plot_weak_scaling.py           # weak-scaling grids and averaged CSV
 python3 plot_runtime_decomposition.py  # one runtime breakdown per DPU count
 ```
