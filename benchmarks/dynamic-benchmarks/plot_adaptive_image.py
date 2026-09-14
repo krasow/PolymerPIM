@@ -3,12 +3,12 @@
 import csv
 import math
 from collections import defaultdict
-from statistics import median
 from dataclasses import dataclass
 from pathlib import Path
 
-from plot_common import (configure_axis, draw_series, legend_handles,
-                         load_pyplot, write_summary)
+from _dynamic_common import (AXIS_LABEL_PT, TEXT_WIDTH_IN, configure_axis,
+                         draw_header, draw_series, legend_handles, load_pyplot,
+                         write_summary)
 
 
 BENCHMARKS = Path(__file__).resolve().parent.parent
@@ -19,6 +19,11 @@ FIGURE = RESULTS / "adaptive-image.pdf"
 # The regime where compile latency dominates the tail; the larger size inverts
 # the ordering because compile cost is fixed while execution scales.
 PLOT_SIZE = 262144
+
+# Figure parameters: two panels, mean and worst iteration.
+FIGURE_SIZE = (TEXT_WIDTH_IN, 3.2)
+PANEL_GAP = 1.6             # tight_layout w_pad; both panels have a y label
+SERIES_LW = 2.1
 
 MODEL_ORDER = (
     "polymerpim-jit",
@@ -135,7 +140,7 @@ def draw(axis, rows, model, value, low=None, high=None):
             [getattr(row, high) - center for center, row in zip(values, points)],
         )
     draw_series(axis, model, list(zip((row.dpus for row in points), values)),
-                yerr=yerr, linewidth=2.1)
+                yerr=yerr, linewidth=SERIES_LW)
 
 
 def plot(rows):
@@ -145,7 +150,7 @@ def plot(rows):
     if not selected:
         raise SystemExit(f"no adaptive_image rows at {PLOT_SIZE} elements/DPU")
 
-    figure, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+    figure, axes = plt.subplots(1, 2, figsize=FIGURE_SIZE)
     mean_axis, worst_axis = axes
     for model in MODEL_ORDER:
         draw(mean_axis, selected, model, "mean_ms")
@@ -153,23 +158,20 @@ def plot(rows):
         # per-trial maxima averages away exactly what this panel measures.
         draw(worst_axis, selected, model, "max_max_ms")
 
-    mean_axis.set_title("Mean iteration", fontweight="bold")
-    worst_axis.set_title("Worst iteration (max over trials)",
-                         fontweight="bold")
-    mean_axis.set_ylabel("Time (ms)")
-    worst_axis.set_ylabel("Time (ms)")
+    mean_axis.set_title("Mean Iteration", fontweight="bold",
+                        fontsize=AXIS_LABEL_PT)
+    worst_axis.set_title("Worst Iteration (Max Over Trials)",
+                         fontsize=AXIS_LABEL_PT, fontweight="bold")
     dpus = sorted({row.dpus for row in selected})
     for axis in (mean_axis, worst_axis):
+        axis.set_ylabel("Time (ms)", fontsize=AXIS_LABEL_PT)
         configure_axis(axis, dpus, dpus, "DPUs")
 
-    figure.suptitle(
-        f"Adaptive image: dynamic execution trade-offs "
-        f"({PLOT_SIZE:,} elements/DPU)", fontsize=14, fontweight="bold")
-    figure.legend(handles=legend_handles(MODEL_ORDER, linewidth=2.1),
-                  loc="upper center", ncol=4, frameon=False,
-                  bbox_to_anchor=(0.5, 0.90))
-    figure.tight_layout(rect=(0, 0, 1, 0.86), w_pad=1.6)
-    figure.savefig(FIGURE)
+    draw_header(figure,
+                f"Adaptive Image: Dynamic Execution Trade-offs "
+                f"({PLOT_SIZE:,} elements/DPU)",
+                legend_handles(MODEL_ORDER, linewidth=SERIES_LW),
+                FIGURE, PANEL_GAP)
 
 
 def main():

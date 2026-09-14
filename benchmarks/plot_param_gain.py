@@ -1,34 +1,52 @@
 #!/usr/bin/env python3
-"""Tuned-vs-default fusion parameters, as gain over default per cell."""
+"""Tuned-vs-default fusion parameters, as gain over default per benchmark.
+
+Whiskers span the per-size gains.  A bootstrap CI resampling both sides
+independently is much wider, but that width is an artefact: the 2048-DPU
+launch noise is common-mode and cancels in the ratio.
+"""
 import collections
 import csv
-import random
 import statistics
-from pathlib import Path
 
-RESULTS = Path(__file__).resolve().parent / "results" / "main"
+from matplotlib import ticker
+
+from _plot_common import (
+    AXIS_LABEL_PT,
+    BENCHMARK_LABELS,
+    EXCLUDED_BENCHMARKS,
+    FIGURE_TITLE_PT,
+    GRID_COLOR,
+    GRID_LW,
+    GRID_MINOR_COLOR,
+    GRID_MINOR_LW,
+    LAYOUT_PAD,
+    LEGEND_PT,
+    PANEL_TITLE_PT,
+    RESULTS,
+    RULE_COLOR,
+    TEXT_WIDTH_IN,
+    TICK_LENGTH,
+    TICK_PAD,
+    TICK_PT,
+    save_figure,
+    trim_spines,
+)
+
+MAIN_RESULTS = RESULTS / "main"
 FIGURE_STEM = "param-gain"
 VARIANT = "polymerpim"
-VARIANT_COLOR = "#3264a8"
-# One figure per DPU count.  Profiles are tuned at 256; at 2048 some tuned
-# builds go bimodal run to run, which the whiskers make visible.
 DPU_COUNTS = (256, 2048)
 
-
-def _gain_ci_width(default, tuned, keys, draws=4000):
-    """Width of the bootstrap 95% CI on the plotted bar, in points."""
-    rng = random.Random(1)
-    bars = []
-    for _ in range(draws):
-        per_size = []
-        for k in keys:
-            a = [rng.choice(default[k]) for _ in default[k]]
-            b = [rng.choice(tuned[k]) for _ in tuned[k]]
-            med_a = statistics.median(a)
-            per_size.append(100 * (med_a - statistics.median(b)) / med_a)
-        bars.append(statistics.median(per_size))
-    bars.sort()
-    return bars[int(0.975 * draws)] - bars[int(0.025 * draws)]
+# Figure parameters.
+FIGURE_SIZE = (TEXT_WIDTH_IN, 2.7)
+BAR_WIDTH = 0.38            # of a slot; the DPU counts sit side by side
+DPU_COLORS = {256: "#3264a8", 2048: "#c1662f"}
+WHISKER_COLOR = "#333333"
+LABEL_MIN_PERCENT = 1.0     # smaller than this reads as zero; leave it bare
+LABEL_OFFSET_PT = 3
+GAIN_TICK_PERCENT = 4
+BENCHMARK_LABEL_ROTATION = 18
 
 
 def load(path):
@@ -37,77 +55,105 @@ def load(path):
         for row in csv.DictReader(handle):
             if row["status"] != "complete" or not row["time"]:
                 continue
-            key = (row["benchmark"], row["variant"], int(row["dpus"]),
+            if (row["variant"] != VARIANT
+                    or row["benchmark"] in EXCLUDED_BENCHMARKS):
+                continue
+            key = (row["benchmark"], int(row["dpus"]),
                    int(row["elements_per_dpu"]))
             cells[key].append(float(row["time"]))
     return cells
 
 
+def gain_and_spread(default, tuned, keys):
+    """Median gain in percent, plus the spread of the per-size gains."""
+    per_size = [100 * (statistics.median(default[k]) - statistics.median(tuned[k]))
+                / statistics.median(default[k]) for k in keys]
+    middle = statistics.median(per_size)
+    return middle, middle - min(per_size), max(per_size) - middle
+
+
 def main():
-    tuned, default = load(RESULTS / "tuned.csv"), load(RESULTS / "default.csv")
+    tuned = load(MAIN_RESULTS / "tuned.csv")
+    default = load(MAIN_RESULTS / "default.csv")
     shared = sorted(set(tuned) & set(default))
     if not shared:
         raise SystemExit("no cells present in both runs")
+
+    sizes = collections.defaultdict(list)
+    for benchmark, dpus, elements in shared:
+        sizes[(benchmark, dpus)].append((benchmark, dpus, elements))
+    gains = {pair: gain_and_spread(default, tuned, keys)
+             for pair, keys in sizes.items()}
+
+    # Largest gain first; alphabetical order buries the one that moves.
+    def rank(name):
+        return max(gain for (benchmark, _), (gain, _, _) in gains.items()
+                   if benchmark == name)
+
+    benchmarks = sorted({benchmark for benchmark, _ in gains}, key=rank,
+                        reverse=True)
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    for dpus in DPU_COUNTS:
-        benchmarks = sorted({key[0] for key in shared if key[2] == dpus})
-        if not benchmarks:
-            print(f"no cells at {dpus} DPUs")
+    figure, axis = plt.subplots(1, 1, figsize=FIGURE_SIZE)
+    for offset, dpus in enumerate(DPU_COUNTS):
+        placed = [(index + (offset - 0.5) * BAR_WIDTH, gains[(benchmark, dpus)])
+                  for index, benchmark in enumerate(benchmarks)
+                  if (benchmark, dpus) in gains]
+        if not placed:
             continue
+        columns = [column for column, _ in placed]
+        middles = [middle for _, (middle, _, _) in placed]
+        lows = [low for _, (_, low, _) in placed]
+        highs = [high for _, (_, _, high) in placed]
+        axis.bar(columns, middles, width=BAR_WIDTH, yerr=[lows, highs],
+                 color=DPU_COLORS[dpus], label=f"{dpus} DPUs",
+                 error_kw=dict(elinewidth=1.2, capsize=3, capthick=1.2,
+                               ecolor=WHISKER_COLOR))
+        for column, middle, high in zip(columns, middles, highs):
+            if abs(middle) < LABEL_MIN_PERCENT:
+                continue
+            axis.annotate(f"{middle:+.1f}%", (column, middle + high),
+                          textcoords="offset points",
+                          xytext=(0, LABEL_OFFSET_PT), ha="center",
+                          va="bottom", fontsize=TICK_PT,
+                          color=DPU_COLORS[dpus])
 
-        figure, axis = plt.subplots(1, 1, figsize=(7.2, 4.4))
-        xs, gains, lows, highs, flags = [], [], [], [], []
-        for index, benchmark in enumerate(benchmarks):
-            keys = [k for k in shared
-                    if k[0] == benchmark and k[1] == VARIANT and k[2] == dpus]
-            if not keys:
-                continue
-            # Median of 5 trials on both sides: one stalled run (a random I/O
-            # or allocation hiccup) cannot move a median, but would dominate a
-            # min/max over raw trials.  Whiskers span the per-size gains.
-            per_size = [100 * (statistics.median(default[k])
-                               - statistics.median(tuned[k]))
-                        / statistics.median(default[k]) for k in keys]
-            middle = statistics.median(per_size)
-            # Flag uncertainty in the gain, not in the raw times: at 2048 DPUs a
-            # cell can be noisy on both sides and still pin the gain down, since
-            # common-mode noise cancels in the ratio.
-            unstable = _gain_ci_width(default, tuned, keys) > 10.0
-            xs.append(index)
-            gains.append(middle)
-            lows.append(middle - min(per_size))
-            highs.append(max(per_size) - middle)
-            flags.append(unstable)
-        bars = axis.bar(xs, gains, width=0.55, yerr=[lows, highs], capsize=4,
-                        color=VARIANT_COLOR)
-        for bar, unstable in zip(bars, flags):
-            if not unstable:
-                continue
-            bar.set_hatch("//")
-            bar.set_edgecolor("white")
-            axis.annotate("unstable", xy=(bar.get_x() + bar.get_width() / 2,
-                                          0), xytext=(0, -14),
-                          textcoords="offset points", ha="center",
-                          fontsize=7, color="#a0342c")
-        axis.axhline(0, color="#444444", linewidth=1)
-        axis.set_xticks(range(len(benchmarks)))
-        axis.set_xticklabels(benchmarks, rotation=30, ha="right")
-        axis.grid(True, axis="y", color="#dddddd", linewidth=0.8)
-        axis.set_axisbelow(True)
-        axis.set_ylabel("Gain from tuned parameters (%)")
-        figure.suptitle(f"Tuned fusion parameters vs defaults ({dpus} DPUs)",
-                        fontsize=14, fontweight="bold")
-        figure.tight_layout(rect=(0, 0, 1, 0.93))
-        path = RESULTS / f"{FIGURE_STEM}-{dpus}.pdf"
-        figure.savefig(path)
-        plt.close(figure)
-        cells = sum(1 for k in shared if k[1] == VARIANT and k[2] == dpus)
-        print(f"Wrote {path}  ({cells} cells, {len(benchmarks)} benchmarks)")
-    return
+    axis.axhline(0, color=RULE_COLOR, linewidth=1.3)
+    axis.set_xticks(range(len(benchmarks)))
+    axis.set_xticklabels([BENCHMARK_LABELS.get(b, b) for b in benchmarks],
+                         fontsize=PANEL_TITLE_PT,
+                         rotation=BENCHMARK_LABEL_ROTATION, ha="right")
+    axis.set_ylabel("Runtime reduction (%)", fontsize=AXIS_LABEL_PT)
+    axis.yaxis.set_major_locator(ticker.MultipleLocator(GAIN_TICK_PERCENT))
+    axis.yaxis.set_minor_locator(ticker.MultipleLocator(GAIN_TICK_PERCENT / 2))
+    axis.tick_params(labelsize=TICK_PT, length=TICK_LENGTH, pad=TICK_PAD)
+    axis.tick_params(axis="y", which="minor", length=1)
+    axis.grid(True, axis="y", which="major", color=GRID_COLOR,
+              linewidth=GRID_LW)
+    axis.grid(True, axis="y", which="minor", color=GRID_MINOR_COLOR,
+              linewidth=GRID_MINOR_LW)
+    axis.set_axisbelow(True)
+    trim_spines(axis)
+    axis.legend(fontsize=LEGEND_PT, frameon=False, ncol=len(DPU_COUNTS),
+                loc="upper right")
+    axis.set_title("Tuned Fusion Parameters vs. Defaults",
+                   fontsize=FIGURE_TITLE_PT, fontweight="bold", pad=4)
+    figure.tight_layout(pad=LAYOUT_PAD)
+    path = MAIN_RESULTS / f"{FIGURE_STEM}.pdf"
+    save_figure(figure, path)
+    plt.close(figure)
+
+    print(f"Wrote {path}  ({len(benchmarks)} benchmarks, {len(shared)} cells)")
+    for benchmark in benchmarks:
+        parts = []
+        for dpus in DPU_COUNTS:
+            if (benchmark, dpus) in gains:
+                middle, low, high = gains[(benchmark, dpus)]
+                parts.append(f"{dpus}: {middle:+5.1f}% (-{low:.1f}/+{high:.1f})")
+        print(f"  {benchmark:<16} " + "   ".join(parts))
 
 
 if __name__ == "__main__":

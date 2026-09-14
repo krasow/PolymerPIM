@@ -111,9 +111,9 @@ EXCLUDED_BENCHMARKS = {"multitask_classifier"}
 BENCHMARK_LABELS = {
     "elementwise": "Elementwise",
     "hist": "Histogram",
-    "kmeans": "K-Means",
-    "knn": "KNN",
-    "linreg": "Linear Regression",
+    "kmeans": "k-Means",
+    "knn": "k-NN",
+    "linreg": "Lin Reg",
     "multitask_classifier": "Multitask Classifier",
     "red": "Reduction",
     "vector_search": "Vector Search",
@@ -129,6 +129,39 @@ VARIANT_STYLES = {
     "polymerpim-pipeline": ("PolymerPIM (interpreter)", "#7b5ea7", "s", "-"),
     "polymerpim-eager": ("PolymerPIM (eager)", "#c26a2a", "^", "--"),
 }
+
+
+# --- Figure style -----------------------------------------------------------
+# Figures are included at the width they are authored at and never rescaled, so
+# a point size here is the point size on the page.  Anything that has to match
+# across figures lives here; geometry specific to one figure stays in its own
+# script, under its own parameter section.
+
+# Canvas, in inches.
+TEXT_WIDTH_IN = 7.0        # \textwidth: the width of a full-width figure
+PANEL_WIDTH_IN = 3.5       # one column of a multi-panel grid
+TEXT_HEIGHT_IN = 9.0       # taller than this and LaTeX scales the figure down
+
+# Type scale, in points.
+FIGURE_TITLE_PT = 13
+PANEL_TITLE_PT = 12.5
+AXIS_LABEL_PT = 11.5
+TICK_PT = 10.5
+LEGEND_PT = 10.5
+ANNOTATION_PT = 10
+
+# Grid and rules.
+GRID_COLOR = "#d8d8d8"
+GRID_MINOR_COLOR = "#eeeeee"
+GRID_LW = 0.8
+GRID_MINOR_LW = 0.6
+RULE_COLOR = "#444444"     # zero line, or whatever the data is read against
+
+# Layout.  pad is what closes the gap under a suptitle; h_pad/w_pad do not.
+LAYOUT_PAD = 0.3
+SAVE_PAD_IN = 0.02
+TICK_LENGTH = 3
+TICK_PAD = 2
 
 
 @dataclass(frozen=True)
@@ -264,8 +297,19 @@ def format_elements(value):
 
 
 def benchmark_title(name, elements_per_dpu):
-    return (f"{BENCHMARK_LABELS[name]}\n"
-            f"{format_elements(elements_per_dpu)} elements/DPU")
+    # One line: two lines cost more height than the title and legend together.
+    return (f"{BENCHMARK_LABELS[name]} "
+            f"({format_elements(elements_per_dpu)}/DPU)")
+
+
+def save_figure(figure, path, pad_inches=SAVE_PAD_IN):
+    """Write a figure cropped to its ink."""
+    figure.savefig(path, bbox_inches="tight", pad_inches=pad_inches)
+
+
+def trim_spines(axis, sides=("top", "right")):
+    for side in sides:
+        axis.spines[side].set_visible(False)
 
 
 def grid_shape(count, max_columns=2):

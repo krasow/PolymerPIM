@@ -5,7 +5,15 @@ import math
 from dataclasses import dataclass, replace
 
 from _plot_common import (
+    AXIS_LABEL_PT,
     BENCHMARK_ORDER,
+    FIGURE_TITLE_PT,
+    GRID_COLOR,
+    GRID_LW,
+    PANEL_TITLE_PT,
+    PANEL_WIDTH_IN,
+    TEXT_WIDTH_IN,
+    TICK_PT,
     VARIANT_ORDER,
     VARIANT_STYLES,
     VIEW,
@@ -15,7 +23,25 @@ from _plot_common import (
     grid_shape,
     load_trials,
     sample_stddev,
+    save_figure,
 )
+
+# Figure parameters.  Sized to the width these are included at; a wider canvas
+# is only scaled down by LaTeX, which shrinks the type with it.
+SINGLE_PANEL_SIZE = (TEXT_WIDTH_IN, 4.6)
+SINGLE_ROW_HEIGHT_IN = 3.2
+ROW_HEIGHT_IN = 2.15        # keeps a full grid inside the ~9in text block
+# Header pieces in inches; a fraction-based band grows with the figure.
+TITLE_IN = 0.20
+LEGEND_ROW_IN = 0.21
+HEADER_GAP_IN = 0.02
+LEGEND_COLUMNS = 3          # what the narrowest figure fits on one row
+LEGEND_PT = 12              # panel-sized, not the shared figure-legend size
+INSET_LEGEND_ANCHOR = (-0.14, 1.226)   # level with the panel titles
+SERIES_LW = 1.8
+MARKER_PT = 5.5
+CAPSIZE = 2.5
+BASELINE_COLOR = "#3b8f5a"
 
 SUMMARY_CSV = VIEW.path("weak-scaling-summary", ".csv")
 ITERATION_FIGURE = VIEW.path("weak-scaling-mean-iteration", ".pdf")
@@ -163,22 +189,24 @@ def configure_dpu_axis(axis, dpus):
     axis.set_xticks(dpus)
     axis.set_xticklabels([str(value) for value in dpus])
     axis.minorticks_off()
-    axis.grid(True, color="#d8d8d8", linewidth=0.8, alpha=0.8)
+    axis.grid(True, color=GRID_COLOR, linewidth=GRID_LW, alpha=0.8)
+    axis.tick_params(labelsize=TICK_PT)
 
 
-def draw_header(figure, handles, title, single, with_legend=True):
-    """Title above a legend, wrapped if narrow; returns the top for the axes."""
+def draw_header(figure, handles, title, with_legend=True):
+    """Title above a legend; returns the top of the axes area as a fraction."""
+    height = figure.get_figheight()
+    figure.suptitle(title, fontsize=FIGURE_TITLE_PT, fontweight="bold",
+                    y=0.995, va="top")
     if not with_legend:
-        figure.suptitle(title, fontsize=15, fontweight="bold", y=0.995)
-        return 0.99
-    # Three labels is what the narrowest figure fits on one row.
-    columns = min(len(handles), 3)
+        return 1.0 - (TITLE_IN + HEADER_GAP_IN) / height
+    columns = min(len(handles), LEGEND_COLUMNS)
     rows = -(-len(handles) // columns)
-    top = 0.99 - 0.05 * (rows - 1)
-    figure.suptitle(title, fontsize=15, fontweight="bold", y=top)
     figure.legend(handles=handles, loc="upper center", ncol=columns,
-                  frameon=False, bbox_to_anchor=(0.5, top - 0.035))
-    return 0.91 - 0.06 * (rows - 1)
+                  frameon=False, fontsize=LEGEND_PT,
+                  bbox_to_anchor=(0.5, 1.0 - TITLE_IN / height))
+    band = TITLE_IN + rows * LEGEND_ROW_IN + HEADER_GAP_IN
+    return 1.0 - band / height
 
 
 def plot_grid(points, benchmarks, value, error, ylabel, title, output,
@@ -192,13 +220,13 @@ def plot_grid(points, benchmarks, value, error, ylabel, title, output,
     # otherwise it goes above the panels.
     rows, columns = grid_shape(len(benchmarks))
     legend_index = 1 if rows * columns > len(benchmarks) else None
-    # A single row of panels needs real height, not the multi-row slice.
     if len(benchmarks) == 1:
-        size = (7, 4.6)
+        size = SINGLE_PANEL_SIZE
     elif rows == 1:
-        size = (min(4.7 * columns, 11), 4.3)
+        size = (min(PANEL_WIDTH_IN * columns, TEXT_WIDTH_IN),
+                SINGLE_ROW_HEIGHT_IN)
     else:
-        size = (3.5 * columns, rows * 2.35)
+        size = (PANEL_WIDTH_IN * columns, rows * ROW_HEIGHT_IN)
     figure, axes = plt.subplots(rows, columns, figsize=size, squeeze=False)
     flat_axes = axes.ravel()
 
@@ -209,38 +237,32 @@ def plot_grid(points, benchmarks, value, error, ylabel, title, output,
         dpus = sorted({point.dpus for point in selected})
         elements_per_dpu = selected[0].elements_per_dpu
         for variant in VARIANT_ORDER:
-            series = sorted(
-                (point.dpus, getattr(point, value))
-                for point in selected if point.variant == variant
-            )
+            series = sorted((point for point in selected
+                             if point.variant == variant),
+                            key=lambda point: point.dpus)
             if not series:
                 continue
             label, color, marker, linestyle = VARIANT_STYLES[variant]
-            x, y = zip(*series)
-            yerr = [
-                getattr(point, error)
-                for point in sorted(
-                    (point for point in selected if point.variant == variant),
-                    key=lambda point: point.dpus,
-                )
-            ]
             axis.errorbar(
-                x, y, yerr=yerr, color=color, marker=marker,
-                linestyle=linestyle, linewidth=1.8, markersize=5.5,
-                capsize=2.5, label=label,
+                [point.dpus for point in series],
+                [getattr(point, value) for point in series],
+                yerr=[getattr(point, error) for point in series],
+                color=color, marker=marker, linestyle=linestyle,
+                linewidth=SERIES_LW, markersize=MARKER_PT, capsize=CAPSIZE,
+                label=label,
             )
 
         axis.set_title(benchmark_title(benchmark, elements_per_dpu),
-                       fontsize=11, fontweight="bold")
+                       fontsize=PANEL_TITLE_PT, fontweight="bold")
         configure_dpu_axis(axis, dpus)
         if VIEW.log_y:
             axis.set_yscale("log")
-        axis.set_xlabel("DPUs")
+        axis.set_xlabel("DPUs", fontsize=AXIS_LABEL_PT)
         if baseline_at_one:
-            axis.axhline(1.0, color="#3b8f5a", linestyle="--", linewidth=1.2,
-                         zorder=1)
+            axis.axhline(1.0, color=BASELINE_COLOR, linestyle="--",
+                         linewidth=1.2, zorder=1)
         if slot % columns == 0:
-            axis.set_ylabel(ylabel)
+            axis.set_ylabel(ylabel, fontsize=AXIS_LABEL_PT)
         axis.margins(y=0.12)
 
     for slot in slots[len(benchmarks):]:
@@ -249,12 +271,12 @@ def plot_grid(points, benchmarks, value, error, ylabel, title, output,
     drawn = {point.variant for point in points}
     handles = [
         Line2D([0], [0], color=color, marker=marker, linestyle=linestyle,
-               linewidth=1.8, markersize=5.5, label=label)
+               linewidth=SERIES_LW, markersize=MARKER_PT, label=label)
         for variant in VARIANT_ORDER if variant in drawn
         for label, color, marker, linestyle in [VARIANT_STYLES[variant]]
     ]
     if baseline_at_one:
-        handles.append(Line2D([0], [0], color="#3b8f5a", linestyle="--",
+        handles.append(Line2D([0], [0], color=BASELINE_COLOR, linestyle="--",
                               linewidth=1.2, label="Hand-tuned baseline"))
     inset = flat_axes[legend_index] if legend_index is not None else None
     if inset is not None:
@@ -262,15 +284,14 @@ def plot_grid(points, benchmarks, value, error, ylabel, title, output,
         # Anchored above the axes box so it sits level with the panel titles
         # rather than the plot areas.
         inset.legend(handles=handles, loc="upper left", frameon=False, ncol=1,
-                     fontsize=10, bbox_to_anchor=(0.0, 1.13))
+                     fontsize=LEGEND_PT,
+                     bbox_to_anchor=INSET_LEGEND_ANCHOR)
     # Tick label widths differ per row, so the y-labels land at different x
     # unless they are aligned explicitly.
     figure.align_ylabels()
-    figure.tight_layout(rect=(0, 0, 1, draw_header(figure, handles, title,
-                                                    len(benchmarks) == 1,
-                                                    inset is None)),
-                        h_pad=0.85, w_pad=0.9)
-    figure.savefig(output)
+    top = draw_header(figure, handles, title, with_legend=inset is None)
+    figure.tight_layout(rect=(0, 0, 1, top), pad=0.1, h_pad=0.6, w_pad=1.0)
+    save_figure(figure, output)
     plt.close(figure)
 
 
@@ -306,12 +327,12 @@ def main():
     plot_grid(
         points, benchmarks, "mean_iteration_ms", "iteration_stddev_ms",
         "Mean iteration time (ms)",
-        "Weak scaling: mean iteration time", ITERATION_FIGURE,
+        "Weak Scaling: Mean Iteration Time", ITERATION_FIGURE,
     )
     plot_grid(
         points, benchmarks, "mean_runtime_s", "runtime_stddev_s",
         "Mean process runtime (s)",
-        "Weak scaling: end-to-end runtime", RUNTIME_FIGURE,
+        "Weak Scaling: End-to-End Runtime", RUNTIME_FIGURE,
     )
     normalized = normalize_to_baseline(
         points, "mean_iteration_ms", "iteration_stddev_ms")
@@ -320,7 +341,7 @@ def main():
             normalized, benchmarks, "mean_iteration_ms",
             "iteration_stddev_ms",
             "Relative to baseline",
-            "Weak scaling: mean iteration time, normalized",
+            "Weak Scaling: Mean Iteration Time, Normalized",
             NORMALIZED_FIGURE, baseline_at_one=True,
         )
     print(f"Averaged {points[0].ntrials} trials per data point")
