@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
-from plot_common import (configure_axis, draw_series, legend_handles,
-                         load_pyplot, write_summary)
+from _dynamic_common import (ANNOTATION_PT, AXIS_LABEL_PT, TEXT_WIDTH_IN,
+                         configure_axis, draw_header, draw_series,
+                         legend_handles, load_pyplot, write_summary)
 
 
 BENCHMARK = "dynamic_query"
@@ -30,6 +31,13 @@ SUMMARY_CSV = RESULTS / "query-sweep-summary.csv"
 # the CSV; they are simply not plotted.
 MIN_TOTAL_ELEMENTS = 1_000_000
 FIGURE = RESULTS / "query-sweep.pdf"
+
+# Figure parameters: two panels, query runtime and break-even point.
+FIGURE_SIZE = (TEXT_WIDTH_IN, 3.3)
+PANEL_GAP = 1.5             # tight_layout w_pad; both panels carry a y label
+REUSE_LINE_COLOR = "#777777"
+ANNOTATION_COLOR = "#555555"
+ANNOTATION_OFFSET_PT = 4
 
 RunKey = Tuple[str, str, str, str]
 MeasurementKey = Tuple[str, int, int]
@@ -176,7 +184,7 @@ def format_elements(value: int) -> str:
 def plot_results(boundaries, measurements):
     plt = load_pyplot(FIGURE)
 
-    figure, axes = plt.subplots(1, 2, figsize=(10, 4.4))
+    figure, axes = plt.subplots(1, 2, figsize=FIGURE_SIZE)
     query_axis, boundary_axis = axes
 
     for model in COMPILED_MODELS:
@@ -200,39 +208,42 @@ def plot_results(boundaries, measurements):
 
     query_axis.set_title("Mean Query Runtime\n"
                          "Cold first batch plus 4 reused batches",
-                         fontweight="bold")
+                         fontweight="bold", fontsize=AXIS_LABEL_PT)
     query_axis.set_yscale("log")
-    query_axis.set_ylabel("Mean Query Runtime (ms)")
+    query_axis.set_ylabel("Mean Query Runtime (ms)", fontsize=AXIS_LABEL_PT)
 
     boundary_axis.set_title(
-        "When compilation pays off vs Pipeline\n"
+        "When compilation pays off vs Interpreter\n"
         "Batches to offset cold-start overhead",
-        fontweight="bold",
+        fontweight="bold", fontsize=AXIS_LABEL_PT,
     )
     boundary_axis.set_yscale("log")
-    boundary_axis.set_ylabel("Batches to break even")
+    boundary_axis.set_ylabel("Batches to break even", fontsize=AXIS_LABEL_PT)
     # The benchmark reuses each compiled kernel this many times, so curves
     # below the line break even within a single query.
     reuse = {int(parse_parameters(row["parameters"])["batches_per_query"])
              for row in csv.DictReader(RUNS_CSV.open(newline=""))
              if row["benchmark"] == BENCHMARK and row["status"] == "complete"}
-    if len(reuse) == 1:
-        batches = reuse.pop()
-        boundary_axis.axhline(batches, color="#777777", linewidth=1.2,
+    batches = reuse.pop() if len(reuse) == 1 else None
+    if batches is not None:
+        boundary_axis.axhline(batches, color=REUSE_LINE_COLOR, linewidth=1.2,
                               linestyle="--")
+        # Lifted off the line and boxed: the curves cross it mid-plot.
         boundary_axis.annotate(f"batches per query = {batches}",
                                xy=(0.02, batches), xycoords=("axes fraction",
                                                              "data"),
-                               fontsize=8, color="#555555",
-                               va="bottom")
+                               textcoords="offset points",
+                               xytext=(0, ANNOTATION_OFFSET_PT),
+                               fontsize=ANNOTATION_PT, color=ANNOTATION_COLOR,
+                               va="bottom",
+                               bbox=dict(boxstyle="round,pad=0.18",
+                                         facecolor="white", edgecolor="none",
+                                         alpha=0.85))
 
-    figure.suptitle("Dynamic query performance", fontsize=15,
-                    fontweight="bold")
-    figure.legend(handles=legend_handles(MODEL_ORDER), loc="upper center",
-                  ncol=4, frameon=False,
-                  bbox_to_anchor=(0.5, 0.94))
-    figure.tight_layout(rect=(0, 0, 1, 0.90), w_pad=1.5)
-    figure.savefig(FIGURE)
+    detail = f" ({batches} batches/query)" if batches is not None else ""
+    draw_header(figure,
+                f"Dynamic Query: Compilation Cost vs. Kernel Reuse{detail}",
+                legend_handles(MODEL_ORDER), FIGURE, PANEL_GAP)
 
 
 def main():

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from _plot_common import (
     BENCHMARK_ORDER,
+    GRID_COLOR,
     RESULTS,
     RUNS_CSV,
     VARIANT_ORDER,
@@ -24,9 +25,39 @@ from _plot_common import (
     grid_shape,
     load_trials,
     sample_stddev,
+    save_figure,
+    trim_spines,
 )
 
 SECTIONS_CSV = RUNS_CSV.with_name(f"{RUNS_CSV.stem}.sections.csv")
+# Stages are recorded in ms; whole-process times read better in seconds.
+MS_PER_SECOND = 1000.0
+
+# Figure parameters.  Authored 4in wide against the other figures' 7in, with
+# the type scaled to match, so include this one at 0.57\textwidth.
+TILE_WIDTH_IN = 2.0
+TILE_HEIGHT_IN = 1.44
+TITLE_BAND_IN = 0.40
+# Fractions of a fixed-width window, so tiles with three and four variants
+# draw bars the same width.
+BAR_WIDTH = 0.16
+BAR_SPACING = 0.26
+BAR_EDGE_LW = 0.3
+TILE_TITLE_PT = 8
+AXIS_LABEL_PT = 7.5
+TICK_PT = 7
+VARIANT_LABEL_PT = 6.5
+VARIANT_ROTATION = 22
+LEGEND_PT = 7
+GRID_LW = 0.6
+
+SHORT_VARIANT = {
+    "polymerpim": "PolymerPIM",
+    "baseline": "Baseline",
+    "simplepim": "SimplePIM",
+    "simplepim-patched": "SimplePIM-DG",
+    "julia": "Julia",
+}
 OUTPUT_DIR = RESULTS / "runtime-decomposition"
 
 STAGES = (
@@ -198,7 +229,9 @@ def plot_dpu_grid(points, dpus, output):
     rows, columns = grid_shape(len(benchmarks))
     legend_index = 1 if rows * columns > len(benchmarks) else None
     figure, axes = plt.subplots(
-        rows, columns, figsize=(3.4 * columns, rows * 2.25 + 0.5),
+        rows, columns,
+        figsize=(TILE_WIDTH_IN * columns,
+                 TILE_HEIGHT_IN * rows + TITLE_BAND_IN),
         squeeze=False,
     )
     flat_axes = axes.ravel()
@@ -211,45 +244,41 @@ def plot_dpu_grid(points, dpus, output):
             if point.dpus == dpus and point.benchmark == benchmark
         }
         variants = [variant for variant in VARIANT_ORDER if variant in selected]
-        x = np.arange(len(variants))
+        x = np.arange(len(variants)) * BAR_SPACING
         bottom = np.zeros(len(variants))
+
+        def seconds(pick):
+            return np.array([pick(selected[variant])
+                             for variant in variants]) / MS_PER_SECOND
 
         # As in the reference, each stage's warm-up contribution immediately
         # caps its solid contribution in the same color with a hatch.
         for stage in STAGES:
             color = STAGE_STYLES[stage][1]
-            measured = np.array([
-                selected[variant].measured_ms[stage] for variant in variants
-            ])
+            measured = seconds(lambda point: point.measured_ms[stage])
             axis.bar(
-                x, measured, width=0.62, bottom=bottom, color=color,
-                edgecolor="black", linewidth=0.3,
+                x, measured, width=BAR_WIDTH, bottom=bottom, color=color,
+                edgecolor="black", linewidth=BAR_EDGE_LW,
             )
             bottom += measured
 
-            cold = np.array([
-                selected[variant].cold_ms[stage] for variant in variants
-            ])
+            cold = seconds(lambda point: point.cold_ms[stage])
             axis.bar(
-                x, cold, width=0.62, bottom=bottom, color=color, hatch="////",
-                edgecolor="black", linewidth=0.3,
+                x, cold, width=BAR_WIDTH, bottom=bottom, color=color,
+                hatch="////", edgecolor="black", linewidth=BAR_EDGE_LW,
             )
             bottom += cold
 
-        residual = np.array([
-            selected[variant].unmeasured_ms for variant in variants
-        ])
+        residual = seconds(lambda point: point.unmeasured_ms)
         axis.bar(
-            x, residual, width=0.62, bottom=bottom,
+            x, residual, width=BAR_WIDTH, bottom=bottom,
             color=STAGE_STYLES["unmeasured"][1],
-            edgecolor="black", linewidth=0.3,
+            edgecolor="black", linewidth=BAR_EDGE_LW,
         )
         bottom += residual
 
-        totals = np.array([selected[variant].total_ms for variant in variants])
-        errors = np.array([
-            selected[variant].total_stddev_ms for variant in variants
-        ])
+        totals = seconds(lambda point: point.total_ms)
+        errors = seconds(lambda point: point.total_stddev_ms)
         axis.errorbar(
             x, totals, yerr=[np.minimum(errors, totals), errors], fmt="none",
             ecolor="black", elinewidth=0.9, capsize=2.5, capthick=0.9,
@@ -258,61 +287,69 @@ def plot_dpu_grid(points, dpus, output):
 
         size = selected[variants[0]].elements_per_dpu
         axis.set_title(benchmark_title(benchmark, size),
-                       fontsize=10.5, fontweight="bold", pad=4)
+                       fontsize=TILE_TITLE_PT, fontweight="bold", pad=3)
+        # Centre the cluster in a window of constant width.
+        middle = (len(variants) - 1) * BAR_SPACING / 2
+        axis.set_xlim(middle - 0.5, middle + 0.5)
         axis.set_xticks(x)
         axis.set_xticklabels(
-            [VARIANT_STYLES[variant][0] for variant in variants],
-            rotation=18, ha="right", fontsize=8,
+            [SHORT_VARIANT.get(variant, VARIANT_STYLES[variant][0])
+             for variant in variants],
+            rotation=VARIANT_ROTATION, ha="right", fontsize=VARIANT_LABEL_PT,
         )
         if slot % columns == 0:
-            axis.set_ylabel("End-to-end time (ms)")
+            axis.set_ylabel("End-to-end time (s)", fontsize=AXIS_LABEL_PT)
         axis.set_ylim(bottom=0)
         axis.margins(y=0.08)
-        axis.grid(axis="y", color="#d8d8d8", linewidth=0.7, alpha=0.75)
+        axis.grid(axis="y", color=GRID_COLOR, linewidth=GRID_LW, alpha=0.75)
         axis.set_axisbelow(True)
+        axis.tick_params(labelsize=TICK_PT, length=2, pad=1.5)
+        trim_spines(axis)
 
     for slot in slots[len(benchmarks):]:
         flat_axes[slot].set_visible(False)
 
     stage_handles = [
-        Patch(facecolor=color, edgecolor="black", linewidth=0.3, label=label)
+        Patch(facecolor=color, edgecolor="black", linewidth=BAR_EDGE_LW,
+              label=label)
         for stage in STAGES
         for label, color in [STAGE_STYLES[stage]]
     ]
     stage_handles.append(Patch(
         facecolor=STAGE_STYLES["unmeasured"][1], edgecolor="black",
-        linewidth=0.3, label=STAGE_STYLES["unmeasured"][0],
+        linewidth=BAR_EDGE_LW, label=STAGE_STYLES["unmeasured"][0],
     ))
     stage_handles.append(Patch(
         facecolor="white", edgecolor="black", hatch="////",
-        linewidth=0.3, label="Warm-up portion",
+        linewidth=BAR_EDGE_LW, label="Warm-up portion",
     ))
     stage_handles.append(Line2D(
         [0], [0], color="black", marker="_", linestyle="none",
         markersize=8, label="Total ± SD",
     ))
 
-    figure.suptitle(
-        f"End-to-end runtime decomposition — {dpus} DPUs",
-        fontsize=14, fontweight="bold", y=0.995,
-    )
+    figure.suptitle(f"End-to-End Runtime Decomposition — {dpus} DPUs",
+                    fontsize=TILE_TITLE_PT, fontweight="bold", y=0.998,
+                    va="top")
     if legend_index is not None:
         legend_axis = flat_axes[legend_index]
         legend_axis.axis("off")
         legend_axis.legend(handles=stage_handles, loc="upper left", ncol=1,
-                           frameon=False, fontsize=8.5, handlelength=1.7,
-                           bbox_to_anchor=(0.0, 1.13))
+                           frameon=False, fontsize=LEGEND_PT, handlelength=1.7,
+                           handletextpad=0.6, labelspacing=0.42,
+                           borderpad=0.0, bbox_to_anchor=(-0.02, 1.149))
     else:
         figure.legend(
             handles=stage_handles, loc="upper center", ncol=4, frameon=False,
-            bbox_to_anchor=(0.5, 0.958), fontsize=7.8,
+            bbox_to_anchor=(0.5, 0.94), fontsize=LEGEND_PT,
             columnspacing=1.15, handlelength=1.7,
         )
     figure.align_ylabels()
-    # The header only needs room for the title once the legend moves inline.
-    top = 0.99 if legend_index is not None else 0.87
-    figure.tight_layout(rect=(0.01, 0.01, 0.99, top), h_pad=0.8, w_pad=0.7)
-    figure.savefig(output)
+    top = 0.995 if legend_index is not None else 0.87
+    # pad, not h_pad/w_pad, is the gap under the suptitle.
+    figure.tight_layout(rect=(0.005, 0.005, 0.995, top), pad=0.15,
+                        h_pad=0.6, w_pad=0.5)
+    save_figure(figure, output)
     plt.close(figure)
     return True
 
