@@ -34,7 +34,22 @@ _config_name, VARIANT_ORDER = SUITES[SUITE]
 CONFIG = BENCHMARKS / "main-benchmarks" / _config_name
 SUITE_RESULTS = (RESULTS if _config_name == "benchmark.toml"
                  else RESULTS / Path(_config_name).stem)
-RUNS_CSV = SUITE_RESULTS / "runs.csv"
+# PLOT_RUNS_CSV plots another runs CSV; its stem tags the figures so two
+# inputs cannot overwrite each other.
+_runs_override = os.environ.get("PLOT_RUNS_CSV", "").strip()
+RUNS_CSV = Path(_runs_override) if _runs_override else SUITE_RESULTS / "runs.csv"
+if _runs_override and not RUNS_CSV.is_file():
+    raise SystemExit(f"PLOT_RUNS_CSV not found: {RUNS_CSV}")
+RUNS_TAG = "" if RUNS_CSV.stem == "runs" else f"-{RUNS_CSV.stem}"
+
+# Restrict the expected grid, or a partial sweep reads as unfinished and every
+# benchmark is dropped.  PLOT_ONLY_DPUS=256,2048  PLOT_ONLY_VARIANTS=polymerpim
+ONLY_DPUS = frozenset(int(part) for part
+                      in os.environ.get("PLOT_ONLY_DPUS", "").split(",")
+                      if part.strip())
+ONLY_VARIANTS = frozenset(part.strip() for part
+                          in os.environ.get("PLOT_ONLY_VARIANTS", "").split(",")
+                          if part.strip())
 
 BENCHMARK_ORDER = (
     "elementwise",
@@ -81,7 +96,7 @@ class FigureView:
         directory.mkdir(parents=True, exist_ok=True)
         dropped = "-no-" + "-".join(sorted(self.without)) if self.without else ""
         scale = "-log" if self.log_y else ""
-        return directory / f"{stem}{dropped}{scale}{extension}"
+        return directory / f"{stem}{RUNS_TAG}{dropped}{scale}{extension}"
 
 
 def _env_names(key):
@@ -150,9 +165,12 @@ def load_selections():
         selections.append(BenchmarkSelection(
             name=name,
             elements_per_dpu=target_size,
-            dpus=tuple(int(value) for value in spec.get("dpus", defaults["dpus"])),
+            dpus=tuple(value for value
+                       in (int(v) for v in spec.get("dpus", defaults["dpus"]))
+                       if not ONLY_DPUS or value in ONLY_DPUS),
             variants=tuple(v for v in spec.get("variants", defaults["variants"])
-                           if VIEW.keeps(v)),
+                           if VIEW.keeps(v)
+                           and (not ONLY_VARIANTS or v in ONLY_VARIANTS)),
             warmup=int(spec.get("warmup", defaults["warmup"])),
             iterations=int(spec.get("iterations", defaults["iterations"])),
             ntrials=int(defaults["ntrials"]),

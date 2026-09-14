@@ -323,6 +323,15 @@ void EventQueue::flush_jit_batch() {
   std::vector<std::pair<std::vector<uint8_t>, std::string>> batch =
       pending_unique_kernels_;
 
+  // Re-link the previous kernels too, so a mix of old and new shapes does not
+  // ping-pong between binaries.  New kernels stay in front to keep slots.
+  for (const auto& prior : last_linked_kernels_) {
+    if (batch.size() >= jit_link_batch_limit()) break;
+    bool present = false;
+    for (const auto& have : batch) present = present || (have == prior);
+    if (!present) batch.push_back(prior);
+  }
+
 #if ENABLE_DPU_LOGGING >= 1
   auto log = DpuRuntime::get().get_logger().lock(logcat::QUEUE_JIT);
   log.first() << "flush JIT batch";
@@ -338,10 +347,10 @@ void EventQueue::flush_jit_batch() {
 #endif
       [batch]() { return jit_compile(batch); });
   for (auto& ev : pending_jit_events_) ev->jit_future = future;
-#if JIT_PIPELINE_FALLBACK
+  // Every kernel in the superset now resolves to this binary.
   for (size_t i = 0; i < batch.size(); ++i)
     inflight_jit_kernels_[batch[i]] = {future, (int)i};
-#endif
+  last_linked_kernels_ = batch;
 
   pending_jit_events_.clear();
   pending_unique_kernels_.clear();
@@ -351,6 +360,9 @@ void EventQueue::lock_for_jit(std::shared_ptr<Event> e) {
   if (e->op != Event::OperationType::COMPUTE || e->is_locked_for_jit ||
       !e->jit_binary_path.empty())
     return;
+#if JIT_PIPELINE_FALLBACK
+  if (unused_compiles_ >= kStopCompilingAfter) return;
+#endif
   if (e->inputs.empty()) return;  // no input: no RPN form (e.g. a fill)
   e->is_locked_for_jit = true;
 
@@ -392,8 +404,7 @@ void EventQueue::lock_for_jit(std::shared_ptr<Event> e) {
     }
   }
 
-#if JIT_PIPELINE_FALLBACK
-  // Relink cached objects into an active batch to avoid binary ping-pong.
+  // Reuse the binary a kernel already sits in, to avoid binary ping-pong.
   auto inflight = inflight_jit_kernels_.find(sig);
   if (inflight != inflight_jit_kernels_.end() &&
       pending_unique_kernels_.empty()) {
@@ -401,7 +412,6 @@ void EventQueue::lock_for_jit(std::shared_ptr<Event> e) {
     e->jit_sub_kernel_idx = inflight->second.slot;
     return;
   }
-#endif
 
   if (pending_unique_kernels_.size() >= jit_link_batch_limit())
     flush_jit_batch();

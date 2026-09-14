@@ -4,6 +4,7 @@
 #include <functional>
 #include <future>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -11,16 +12,10 @@
 #include <typeindex>
 #include <variant>
 
-#include "config.h"
-
-#if JIT_PIPELINE_FALLBACK
-#include <map>
-
-#include "jit.h"
-#endif
-
 #include "common.h"
+#include "config.h"
 #include "detail/vector_desc.h"
+#include "jit.h"
 
 class Event : public std::enable_shared_from_this<Event> {
  public:
@@ -184,12 +179,19 @@ class EventQueue {
   std::vector<std::pair<std::vector<uint8_t>, std::string>>
       pending_unique_kernels_;
   std::vector<std::shared_ptr<Event>> pending_jit_events_;
-#if JIT_PIPELINE_FALLBACK
   struct InflightJitKernel {
     std::shared_future<std::string> binary;
     int slot;
   };
   std::map<Signature, InflightJitKernel> inflight_jit_kernels_;
+  // Last binary's kernels; the next link re-includes them so it is a superset.
+  std::vector<std::pair<std::vector<uint8_t>, std::string>>
+      last_linked_kernels_;
+#if JIT_PIPELINE_FALLBACK
+  // Interpreted launches in a row whose compile never landed; past the
+  // threshold compiling is pure overhead.
+  static constexpr uint32_t kStopCompilingAfter = 8;
+  uint32_t unused_compiles_ = 0;
 #endif
 
   std::string current_binary_path_;

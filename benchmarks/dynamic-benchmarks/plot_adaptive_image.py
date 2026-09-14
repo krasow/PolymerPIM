@@ -16,7 +16,9 @@ RESULTS = BENCHMARKS / "results" / "dynamic"
 RUNS_CSV = RESULTS / "adaptive-image.csv"
 SUMMARY_CSV = RESULTS / "adaptive-image-summary.csv"
 FIGURE = RESULTS / "adaptive-image.pdf"
-TRACE_TXT = RESULTS / "adaptive-image-trace.txt"
+# The regime where compile latency dominates the tail; the larger size inverts
+# the ordering because compile cost is fixed while execution scales.
+PLOT_SIZE = 262144
 
 MODEL_ORDER = (
     "polymerpim-jit",
@@ -87,28 +89,6 @@ def load_rows():
     return rows
 
 
-def load_traces():
-    # Per-iteration times from the focused 64-DPU runs; absent is fine.
-    collected = defaultdict(list)
-    if not TRACE_TXT.is_file():
-        return {}
-    for line in TRACE_TXT.read_text().splitlines():
-        fields = line.split()
-        if len(fields) < 4 or not fields[3].startswith("iteration_ms="):
-            continue
-        series = [float(value) for value
-                  in fields[3].split("=", 1)[1].split(";") if value]
-        if series:
-            collected[(f"polymerpim-{fields[0]}", int(fields[1]))].append(series)
-    # Median per iteration index, so one unlucky trial cannot set the shape.
-    traces = {}
-    for key, trials in collected.items():
-        width = min(len(series) for series in trials)
-        traces[key] = [median(series[index] for series in trials)
-                       for index in range(width)]
-    return traces
-
-
 def summarize(rows):
     grouped = defaultdict(list)
     for row in rows:
@@ -161,51 +141,34 @@ def draw(axis, rows, model, value, low=None, high=None):
 def plot(rows):
     plt = load_pyplot(FIGURE)
 
-    sizes = sorted({row.elements_per_dpu for row in rows})
-    if len(sizes) != 2:
-        raise SystemExit("adaptive_image plot expects exactly two problem sizes")
+    selected = [row for row in rows if row.elements_per_dpu == PLOT_SIZE]
+    if not selected:
+        raise SystemExit(f"no adaptive_image rows at {PLOT_SIZE} elements/DPU")
 
-    traces = load_traces()
-    rows_count = 3 if traces else 2
-    figure, axes = plt.subplots(rows_count, len(sizes),
-                                figsize=(10, 3.2 * rows_count))
-    for column, size in enumerate(sizes):
-        selected = [row for row in rows if row.elements_per_dpu == size]
-        column_axes = list(axes[:, column])
-        trace_axis = column_axes.pop(0) if traces else None
-        mean_axis, worst_axis = column_axes
-        for model in MODEL_ORDER:
-            draw(mean_axis, selected, model, "mean_ms")
-            draw(worst_axis, selected, model,
-                 "max_mean_ms", "max_min_ms", "max_max_ms")
-            if trace_axis is not None:
-                draw_series(trace_axis, model,
-                            list(enumerate(traces.get((model, size), []),
-                                           start=1)),
-                            linewidth=1.6)
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4.2))
+    mean_axis, worst_axis = axes
+    for model in MODEL_ORDER:
+        draw(mean_axis, selected, model, "mean_ms")
+        # Max over trials: a compile stall is a rare event, so averaging the
+        # per-trial maxima averages away exactly what this panel measures.
+        draw(worst_axis, selected, model, "max_max_ms")
 
-        top_axis = trace_axis if trace_axis is not None else mean_axis
-        top_axis.set_title(f"{size:,} elements/DPU", fontweight="bold")
-        mean_axis.set_ylabel("Mean iteration (ms)" if column == 0 else "")
-        worst_axis.set_ylabel(
-            "Worst iteration: mean, min-max (ms)" if column == 0 else "")
-        if trace_axis is not None:
-            trace_axis.set_ylabel(
-                "Iteration time, 64 DPUs (ms)" if column == 0 else "")
-            trace_axis.set_xlabel("Iteration")
-            trace_axis.grid(True, which="major", color="#d8d8d8",
-                            linewidth=0.8)
-            trace_axis.set_axisbelow(True)
-        dpus = sorted({row.dpus for row in selected})
-        for axis in (mean_axis, worst_axis):
-            configure_axis(axis, dpus, dpus, "DPUs")
+    mean_axis.set_title("Mean iteration", fontweight="bold")
+    worst_axis.set_title("Worst iteration (max over trials)",
+                         fontweight="bold")
+    mean_axis.set_ylabel("Time (ms)")
+    worst_axis.set_ylabel("Time (ms)")
+    dpus = sorted({row.dpus for row in selected})
+    for axis in (mean_axis, worst_axis):
+        configure_axis(axis, dpus, dpus, "DPUs")
 
-    figure.suptitle("Adaptive image: dynamic execution trade-offs",
-                    fontsize=15, fontweight="bold")
+    figure.suptitle(
+        f"Adaptive image: dynamic execution trade-offs "
+        f"({PLOT_SIZE:,} elements/DPU)", fontsize=14, fontweight="bold")
     figure.legend(handles=legend_handles(MODEL_ORDER, linewidth=2.1),
                   loc="upper center", ncol=4, frameon=False,
-                  bbox_to_anchor=(0.5, 0.955))
-    figure.tight_layout(rect=(0, 0, 1, 0.925), h_pad=1.6, w_pad=1.25)
+                  bbox_to_anchor=(0.5, 0.90))
+    figure.tight_layout(rect=(0, 0, 1, 0.86), w_pad=1.6)
     figure.savefig(FIGURE)
 
 

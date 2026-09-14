@@ -25,6 +25,10 @@ RESULTS = BENCHMARKS / "results" / "dynamic"
 RUNS_CSV = RESULTS / "query-sweep.csv"
 SECTIONS_CSV = RESULTS / "query-sweep.sections.csv"
 SUMMARY_CSV = RESULTS / "query-sweep-summary.csv"
+# Below ~1M elements the fixed JIT compile cost dominates every variant, so the
+# curves measure compiler overhead rather than execution.  Smaller runs stay in
+# the CSV; they are simply not plotted.
+MIN_TOTAL_ELEMENTS = 1_000_000
 FIGURE = RESULTS / "query-sweep.pdf"
 
 RunKey = Tuple[str, str, str, str]
@@ -80,22 +84,31 @@ def load_measurements() -> Dict[MeasurementKey, Measurement]:
     sections = load_sections()
     grouped = defaultdict(lambda: defaultdict(list))
 
+    # A rerun appends rows rather than replacing them, so keep only the newest
+    # row per (variant, size, trial); otherwise old and new runs get averaged.
+    newest = {}
     with RUNS_CSV.open(newline="") as file:
         for row in csv.DictReader(file):
             if row["benchmark"] != BENCHMARK or row["status"] != "complete":
                 continue
-
-            query_ops = int(parse_parameters(row["parameters"])["query_ops"])
-            measured = sections.get(run_key(row), {})
-            if not {"query_first", "query_reuse"} <= measured.keys():
+            if int(row["total_elements"]) < MIN_TOTAL_ELEMENTS:
                 continue
+            newest[(row["variant"], row["elements_per_dpu"], row["dpus"],
+                    row["trial"])] = row
 
-            key = row["variant"], int(row["total_elements"]), query_ops
-            grouped[key]["first_ms"].append(measured["query_first"])
-            grouped[key]["reuse_ms"].append(measured["query_reuse"])
-            grouped[key]["query_ms"].append(float(row["time"]))
-            if row["real_s"]:
-                grouped[key]["wall_s"].append(float(row["real_s"]))
+    for row in newest.values():
+
+        query_ops = int(parse_parameters(row["parameters"])["query_ops"])
+        measured = sections.get(run_key(row), {})
+        if not {"query_first", "query_reuse"} <= measured.keys():
+            continue
+
+        key = row["variant"], int(row["total_elements"]), query_ops
+        grouped[key]["first_ms"].append(measured["query_first"])
+        grouped[key]["reuse_ms"].append(measured["query_reuse"])
+        grouped[key]["query_ms"].append(float(row["time"]))
+        if row["real_s"]:
+            grouped[key]["wall_s"].append(float(row["real_s"]))
 
     measurements = {}
     for key, samples in grouped.items():
@@ -198,7 +211,20 @@ def plot_results(boundaries, measurements):
     )
     boundary_axis.set_yscale("log")
     boundary_axis.set_ylabel("Batches to break even")
-    boundary_axis.axhline(1, color="#777777", linewidth=1)
+    # The benchmark reuses each compiled kernel this many times, so curves
+    # below the line break even within a single query.
+    reuse = {int(parse_parameters(row["parameters"])["batches_per_query"])
+             for row in csv.DictReader(RUNS_CSV.open(newline=""))
+             if row["benchmark"] == BENCHMARK and row["status"] == "complete"}
+    if len(reuse) == 1:
+        batches = reuse.pop()
+        boundary_axis.axhline(batches, color="#777777", linewidth=1.2,
+                              linestyle="--")
+        boundary_axis.annotate(f"batches per query = {batches}",
+                               xy=(0.02, batches), xycoords=("axes fraction",
+                                                             "data"),
+                               fontsize=8, color="#555555",
+                               va="bottom")
 
     figure.suptitle("Dynamic query performance", fontsize=15,
                     fontweight="bold")

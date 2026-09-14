@@ -85,7 +85,14 @@ bool EventQueue::process_next() {
   log_launch(e);
 
   begin_running(e);
+#if JIT_PIPELINE_FALLBACK
+  // Gate both compile paths together: skipping only the batch path diverts
+  // here, which compiles synchronously and blocks.
+  if (unused_compiles_ < kStopCompilingAfter) compile_kernel_if_unbatched(e);
+  if (e->is_locked_for_jit && !e->jit_pipeline_fallback) unused_compiles_ = 0;
+#else
   compile_kernel_if_unbatched(e);
+#endif
   switch_dpu_binary(e);
 
   try {
