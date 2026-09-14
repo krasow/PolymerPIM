@@ -1,5 +1,5 @@
 const DEFAULT_FUSION_BUILD = Dict(
-    "FUSION_LOOKAHEAD" => 128,
+    "QUEUE_ABSORB_LIMIT" => 32,
     "MAX_HFUSE_CHAINS" => 9,
     "JIT_BATCH_SIZE" => 16,
     "MAX_VFUSE_OPS" => 128,
@@ -8,7 +8,6 @@ const DEFAULT_FUSION_BUILD = Dict(
 )
 
 const DEFAULT_FUSION_SEARCH = Dict(
-    "FUSION_LOOKAHEAD" => [0, 1, 2, 4, 8, 16, 32, 64, 128],
     # 9 is the ceiling: a tenth chain overflows WRAM at stack depth 3.
     "MAX_HFUSE_CHAINS" => [1, 2, 4, 6, 8, 9],
     "JIT_BATCH_SIZE" => [0, 1, 2, 4, 8, 16, 32],
@@ -16,7 +15,7 @@ const DEFAULT_FUSION_SEARCH = Dict(
 )
 
 const CORE_FUSION_KNOBS = (
-    "FUSION_LOOKAHEAD",
+    "QUEUE_ABSORB_LIMIT",
     "MAX_HFUSE_CHAINS",
     "JIT_BATCH_SIZE",
     "MAX_VFUSE_OPS",
@@ -72,6 +71,10 @@ function coordinate_descent(seed::Dict{String,Int}, search, passes::Int,
     for pass in 1:passes
         changed = false
         for knob in CORE_FUSION_KNOBS
+            # A knob with no candidate list is not swept this run: the absorb
+            # limit is out of the default search but --absorb-limit puts it
+            # back, so the order here stays canonical either way.
+            haskey(search, knob) || continue
             local_build, local_result = best, best_result
             for candidate in unique([best[knob]; search[knob]])
                 trial = copy(best)
@@ -101,7 +104,7 @@ function tune_usage(io::IO = stdout)
       --warmup N                  Override warmup iterations
       --iterations N              Override measured iterations
       --passes N                  Maximum coordinate-descent passes
-      --lookahead N[,N...]        FUSION_LOOKAHEAD candidates
+      --absorb-limit N[,N...]        QUEUE_ABSORB_LIMIT candidates
       --hfuse-chains N[,N...]     MAX_HFUSE_CHAINS candidates
       --jit-batch N[,N...]        JIT_BATCH_SIZE candidates
       --vfuse-ops N[,N...]        MAX_VFUSE_OPS candidates
@@ -151,7 +154,7 @@ function parse_tune_args(args)
             options.reset = true
             options.resume = false
         elseif arg in ("--dpus", "--elements-per-dpu", "--warmup", "--iterations",
-                       "--passes", "--lookahead", "--hfuse-chains", "--jit-batch",
+                       "--passes", "--absorb-limit", "--hfuse-chains", "--jit-batch",
                        "--vfuse-ops", "--workspace", "--profiles", "--checkpoints",
                        "--timeout", "--build-timeout", "--config")
             value = option_value(args, index, arg)
@@ -167,8 +170,8 @@ function parse_tune_args(args)
             elseif arg == "--passes"
                 options.passes = parse(Int, value)
                 options.passes > 0 || error("--passes must be positive")
-            elseif arg == "--lookahead"
-                options.search["FUSION_LOOKAHEAD"] = nonnegative_list(value)
+            elseif arg == "--absorb-limit"
+                options.search["QUEUE_ABSORB_LIMIT"] = nonnegative_list(value)
             elseif arg == "--hfuse-chains"
                 options.search["MAX_HFUSE_CHAINS"] = int_list(value)
             elseif arg == "--jit-batch"

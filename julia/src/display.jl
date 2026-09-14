@@ -77,7 +77,7 @@ function versioninfo(io::IO = stdout)
                                       " batch=", cfg("JIT_BATCH_SIZE")))
     _field(io, "Build", string(inst("BUILD_TYPE"), ", ", cfg("CXX_STANDARD"),
                                ", ", inst("CXX")))
-    _field(io, "Fusion", string("lookahead=", cfg("FUSION_LOOKAHEAD"),
+    _field(io, "Fusion", string("absorb=", cfg("QUEUE_ABSORB_LIMIT"),
                                 " chains=", cfg("MAX_HFUSE_CHAINS"),
                                 " ops=", cfg("MAX_VFUSE_OPS")))
     _field(io, "Slots", string(MAX_VFUSE_INPUTS, " operands, ",

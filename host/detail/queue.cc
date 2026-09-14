@@ -474,7 +474,7 @@ void EventQueue::grow_fusion_batch(const std::shared_ptr<Event>& e) {
 #if PIPELINE
   if (e->op == Event::OperationType::COMPUTE) {
     size_t absorbed = 0;
-    while (absorbed < FUSION_LOOKAHEAD && !operations_.empty()) {
+    while (absorbed < QUEUE_ABSORB_LIMIT && !operations_.empty()) {
       auto next = operations_.front();
       if (next->op != Event::OperationType::COMPUTE) break;
       if (!try_fuse(e, next)) break;

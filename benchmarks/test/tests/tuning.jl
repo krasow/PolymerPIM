@@ -4,17 +4,17 @@
           [1, 2, 4, 6, 8, 9]
     seed = copy(BenchmarkRunner.DEFAULT_FUSION_BUILD)
     search = Dict(knob => [value] for (knob, value) in seed)
-    search["FUSION_LOOKAHEAD"] = [1, 2, 3]
+    search["QUEUE_ABSORB_LIMIT"] = [1, 2, 3]
     evaluations = Ref(0)
     evaluate = build -> begin
         evaluations[] += 1
-        objective = Float64((build["FUSION_LOOKAHEAD"] - 2)^2 + 1)
+        objective = Float64((build["QUEUE_ABSORB_LIMIT"] - 2)^2 + 1)
         BenchmarkRunner.TuneResult("ok", objective, [objective], [(1, 1)])
     end
 
     best, result = BenchmarkRunner.coordinate_descent(seed, search, 3, evaluate)
 
-    @test best["FUSION_LOOKAHEAD"] == 2
+    @test best["QUEUE_ABSORB_LIMIT"] == 2
     @test result.objective == 1.0
     @test evaluations[] < 3 * sum(length, values(search))
 end
@@ -32,7 +32,7 @@ end
             TOML.print(io, profile)
         end
         loaded = BenchmarkRunner.load_fusion_profile(directory, "elementwise")
-        @test loaded.build["FUSION_LOOKAHEAD"] == 1
+        @test loaded.build["QUEUE_ABSORB_LIMIT"] == 1
 
         text = captured_output() do
             run_cli([
@@ -42,7 +42,7 @@ end
             ])
         end
         @test occursin("Using fusion profile", text)
-        @test occursin("FUSION_LOOKAHEAD=1", text)
+        @test occursin("QUEUE_ABSORB_LIMIT=1", text)
     end
 end
 
@@ -65,7 +65,7 @@ end
         result = BenchmarkRunner.TuneResult("ok", 4.5, [4.5], [(2, 64)])
         checkpoint = BenchmarkRunner.load_checkpoint(config, spec, options)
         @test BenchmarkRunner.record!(
-            checkpoint, build, result, 1, "FUSION_LOOKAHEAD", 128)
+            checkpoint, build, result, 1, "QUEUE_ABSORB_LIMIT", 128)
 
         resumed = BenchmarkRunner.load_checkpoint(
             config, spec, BenchmarkRunner.TuneOptions(
@@ -103,7 +103,7 @@ end
         failed = BenchmarkRunner.TuneResult(
             "runtime_failed", Inf, Float64[], Tuple{Int,Int}[])
         BenchmarkRunner.record!(checkpoint, copy(BenchmarkRunner.DEFAULT_FUSION_BUILD),
-                                failed, 1, "FUSION_LOOKAHEAD", 128)
+                                failed, 1, "QUEUE_ABSORB_LIMIT", 128)
         resumed = BenchmarkRunner.load_checkpoint(config, spec, options)
         @test isempty(resumed.cache)
         @test length(resumed.trials) == 1
