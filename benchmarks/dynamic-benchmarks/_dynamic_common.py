@@ -8,15 +8,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _plot_common import (  # noqa: E402
     ANNOTATION_PT, AXIS_LABEL_PT, FIGURE_TITLE_PT, GRID_COLOR, GRID_LW,
-    GRID_MINOR_COLOR, GRID_MINOR_LW, LAYOUT_PAD, LEGEND_PT, TEXT_WIDTH_IN,
-    TICK_PT, save_figure,
+    GRID_MINOR_COLOR, GRID_MINOR_LW, HEADER_GAP_IN, LAYOUT_PAD, LEGEND_PT,
+    TEXT_WIDTH_IN, TICK_PT, artist_bottom_in, fit_below_header,
+    header_rect_top, save_figure,
 )
 
-# Header geometry, as figure fractions.  Both dynamic figures are one row of
-# two panels under a title and a single legend row.
+# Both dynamic figures are one row of two panels under a title and a single
+# legend row.  The header is measured, not reserved as a fraction: these are
+# the shortest figures in the paper, so a guessed band lands on the panels.
 TITLE_Y = 0.995
-LEGEND_Y = 0.952
-HEADER_TOP = 0.915
 SERIES_LW = 2.2
 MARKER_PT = 6
 
@@ -94,10 +94,17 @@ def draw_header(figure, title, handles, path, w_pad):
     """Title, then one legend row, then the panels; writes the figure."""
     figure.suptitle(title, fontsize=FIGURE_TITLE_PT, fontweight="bold",
                     y=TITLE_Y, va="top")
+    figure.canvas.draw()   # the title has no extent until it is drawn
+    below = artist_bottom_in(figure, figure._suptitle) + HEADER_GAP_IN
     figure.legend(handles=handles, fontsize=LEGEND_PT, loc="upper center",
                   ncol=len(handles), frameon=False,
-                  bbox_to_anchor=(0.5, LEGEND_Y))
-    figure.tight_layout(rect=(0, 0, 1, HEADER_TOP), pad=LAYOUT_PAD, w_pad=w_pad)
+                  bbox_to_anchor=(0.5, 1.0 - below / figure.get_figheight()),
+                  # matplotlib pads the legend off its anchor and inside its
+                  # own box by half a font size unless told not to.
+                  borderpad=0.0, borderaxespad=0.0)
+    figure.tight_layout(rect=(0, 0, 1, header_rect_top(figure)),
+                        pad=LAYOUT_PAD, w_pad=w_pad)
+    fit_below_header(figure)
     save_figure(figure, path)
 
 

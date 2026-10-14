@@ -15,14 +15,18 @@ from dataclasses import dataclass
 from _plot_common import (
     BENCHMARK_ORDER,
     GRID_COLOR,
+    HEADER_GAP_IN,
     RESULTS,
     RUNS_CSV,
     VARIANT_ORDER,
     VARIANT_STYLES,
+    artist_bottom_in,
     average,
     benchmark_title,
     complete_trial_rows,
+    fit_below_header,
     grid_shape,
+    header_rect_top,
     load_trials,
     sample_stddev,
     save_figure,
@@ -339,16 +343,22 @@ def plot_dpu_grid(points, dpus, output):
                            handletextpad=0.6, labelspacing=0.42,
                            borderpad=0.0, bbox_to_anchor=(-0.02, 1.149))
     else:
+        figure.canvas.draw()   # the title has no extent until it is drawn
+        below = artist_bottom_in(figure, figure._suptitle) + HEADER_GAP_IN
         figure.legend(
             handles=stage_handles, loc="upper center", ncol=4, frameon=False,
-            bbox_to_anchor=(0.5, 0.94), fontsize=LEGEND_PT,
-            columnspacing=1.15, handlelength=1.7,
+            bbox_to_anchor=(0.5, 1.0 - below / figure.get_figheight()),
+            fontsize=LEGEND_PT, columnspacing=1.15, handlelength=1.7,
+            # matplotlib pads the legend off its anchor and inside its own box
+            # by half a font size unless told not to.
+            borderpad=0.0, borderaxespad=0.0,
         )
     figure.align_ylabels()
-    top = 0.995 if legend_index is not None else 0.87
+    top = header_rect_top(figure)
     # pad, not h_pad/w_pad, is the gap under the suptitle.
     figure.tight_layout(rect=(0.005, 0.005, 0.995, top), pad=0.15,
                         h_pad=0.6, w_pad=0.5)
+    fit_below_header(figure)
     save_figure(figure, output)
     plt.close(figure)
     return True

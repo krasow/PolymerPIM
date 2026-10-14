@@ -18,10 +18,12 @@ from _plot_common import (
     FIGURE_TITLE_PT,
     GRID_COLOR,
     GRID_LW,
+    HEADER_GAP_IN,
     RESULTS,
     TEXT_WIDTH_IN,
     TICK_LENGTH,
     TICK_PAD,
+    artist_bottom_in,
     TICK_PT,
     save_figure,
     trim_spines,
@@ -227,14 +229,21 @@ def main():
         if with_legend:
             # Shared title, legend, then this figure's own label; a bare
             # figure stacked underneath needs only the last.
-            figure.text(0.5, TOP_Y, "Fusion Parameter Search",
-                        fontsize=FIGURE_TITLE_PT, ha="center", va="top",
-                        fontweight="bold")
+            title = figure.text(0.5, TOP_Y, "Fusion Parameter Search",
+                                fontsize=FIGURE_TITLE_PT, ha="center",
+                                va="top", fontweight="bold")
+            # Under the title's measured bottom; a fixed fraction put the
+            # legend inside it on a figure this short.
+            figure.canvas.draw()
+            below = artist_bottom_in(figure, title) + HEADER_GAP_IN
             legend = figure.legend(handles, labels, loc="upper center",
                                    fontsize=TICK_PT, ncol=len(labels),
                                    frameon=False,
-                                   bbox_to_anchor=(0.5, 0.947),
-                                   handletextpad=0.4, columnspacing=1.2)
+                                   bbox_to_anchor=(0.5, 1.0 - below / height),
+                                   handletextpad=0.4, columnspacing=1.2,
+                                   # matplotlib pads the legend off its anchor
+                                   # by half a font size unless told not to.
+                                   borderpad=0.0, borderaxespad=0.0)
             # Place the local title under the legend's measured bottom edge.
             figure.canvas.draw()
             box = legend.get_window_extent().transformed(

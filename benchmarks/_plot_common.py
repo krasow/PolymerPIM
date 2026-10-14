@@ -302,6 +302,54 @@ def benchmark_title(name, elements_per_dpu):
             f"({format_elements(elements_per_dpu)}/DPU)")
 
 
+HEADER_GAP_IN = 0.06       # breathing room under the title and legend
+
+
+def artist_bottom_in(figure, artist):
+    """Inches from the top of the figure to the bottom of `artist`."""
+    box = artist.get_window_extent(figure.canvas.get_renderer())
+    return figure.get_figheight() - box.y0 / figure.dpi
+
+
+def header_rect_top(figure, gap_in=HEADER_GAP_IN):
+    """The free fraction below the suptitle and any figure legend.
+
+    Measured after a draw, not reserved as a fraction of the height: a title is
+    a fixed number of inches tall whatever the figure, so a guessed fraction
+    squeezes the shortest one first and the legend lands on the panel titles.
+    """
+    figure.canvas.draw()
+    used = max((artist_bottom_in(figure, a)
+                for a in (figure._suptitle, *figure.legends) if a is not None),
+               default=0.0)
+    return 1.0 - (used + gap_in) / figure.get_figheight()
+
+
+def header_bottom_in(figure):
+    """Inches from the top of the figure to the bottom of title and legend."""
+    return max((artist_bottom_in(figure, a)
+                for a in (figure._suptitle, *figure.legends) if a is not None),
+               default=0.0)
+
+
+def fit_below_header(figure, gap_in=HEADER_GAP_IN):
+    """Raise the panels until their topmost ink clears the header by `gap_in`.
+
+    tight_layout leaves slack above the panels that does not depend on the rect
+    it was given, so the gap can only be closed once it has run.
+    """
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    height = figure.get_figheight()
+    tops = [height - axis.get_tightbbox(renderer).y1 / figure.dpi
+            for axis in figure.axes if axis.get_visible()]
+    if not tops:
+        return
+    slack = min(tops) - (header_bottom_in(figure) + gap_in)
+    if slack > 0:
+        figure.subplots_adjust(top=figure.subplotpars.top + slack / height)
+
+
 def save_figure(figure, path, pad_inches=SAVE_PAD_IN):
     """Write a figure cropped to its ink."""
     figure.savefig(path, bbox_inches="tight", pad_inches=pad_inches)
