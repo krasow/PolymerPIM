@@ -130,6 +130,7 @@ function sync()
     flush_locals!()          # queued scatter updates first, so they inline
     _run_dangling_lazies()   # then values nothing else will run
     PolymerPIM.dpu_sync()
+    _release_cut_temps!()    # drained, so the last split's intermediates go
 end
 
 """
