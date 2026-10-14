@@ -78,7 +78,7 @@ function main()
     query_id = Ref{Int}(0)
     last_query = Vector{T}(undef, DIM)
 
-    # score = sum_d (col_d + query_d); findmax returns the score and the first
+    # score = sum_d (col_d * query_d); findmax returns the score and the first
     # global row index as two 32-bit fields.
     function run_queries(count, st)
         result = (typemin(Int32), typemax(UInt32))
