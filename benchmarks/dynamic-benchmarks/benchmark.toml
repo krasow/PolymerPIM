@@ -14,6 +14,8 @@ variants = [
 group_by_variant = true
 
 [[adaptive_image]]
+# Fails above 1024 DPUs, pre-existing on main.
+dpus = [64, 128, 256, 512, 1024]
 elements_per_dpu = [262144, 524288]
 parameters = { channels = 4, check_interval = 2, tolerance = 2 }
 
