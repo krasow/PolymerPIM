@@ -8,6 +8,7 @@ from _plot_common import (
     AXIS_LABEL_PT,
     BENCHMARK_ORDER,
     FIGURE_TITLE_PT,
+    HEADER_GAP_IN,
     GRID_COLOR,
     GRID_LW,
     PANEL_TITLE_PT,
@@ -20,7 +21,10 @@ from _plot_common import (
     average,
     benchmark_title,
     complete_trial_rows,
+    artist_bottom_in,
+    fit_below_header,
     grid_shape,
+    header_rect_top,
     load_trials,
     sample_stddev,
     save_figure,
@@ -32,9 +36,6 @@ SINGLE_PANEL_SIZE = (TEXT_WIDTH_IN, 4.6)
 SINGLE_ROW_HEIGHT_IN = 3.2
 ROW_HEIGHT_IN = 2.15        # keeps a full grid inside the ~9in text block
 # Header pieces in inches; a fraction-based band grows with the figure.
-TITLE_IN = 0.20
-LEGEND_ROW_IN = 0.21
-HEADER_GAP_IN = 0.02
 LEGEND_COLUMNS = 3          # what the narrowest figure fits on one row
 LEGEND_PT = 12              # panel-sized, not the shared figure-legend size
 INSET_LEGEND_ANCHOR = (-0.14, 1.226)   # level with the panel titles
@@ -195,18 +196,20 @@ def configure_dpu_axis(axis, dpus):
 
 def draw_header(figure, handles, title, with_legend=True):
     """Title above a legend; returns the top of the axes area as a fraction."""
-    height = figure.get_figheight()
     figure.suptitle(title, fontsize=FIGURE_TITLE_PT, fontweight="bold",
                     y=0.995, va="top")
-    if not with_legend:
-        return 1.0 - (TITLE_IN + HEADER_GAP_IN) / height
-    columns = min(len(handles), LEGEND_COLUMNS)
-    rows = -(-len(handles) // columns)
-    figure.legend(handles=handles, loc="upper center", ncol=columns,
-                  frameon=False, fontsize=LEGEND_PT,
-                  bbox_to_anchor=(0.5, 1.0 - TITLE_IN / height))
-    band = TITLE_IN + rows * LEGEND_ROW_IN + HEADER_GAP_IN
-    return 1.0 - band / height
+    if with_legend:
+        figure.canvas.draw()   # the title has no extent until it is drawn
+        below = artist_bottom_in(figure, figure._suptitle) + HEADER_GAP_IN
+        figure.legend(handles=handles, loc="upper center",
+                      ncol=min(len(handles), LEGEND_COLUMNS), frameon=False,
+                      fontsize=LEGEND_PT,
+                      bbox_to_anchor=(0.5,
+                                      1.0 - below / figure.get_figheight()),
+                      # matplotlib pads the legend off its anchor and inside
+                      # its own box by half a font size unless told not to.
+                      borderpad=0.0, borderaxespad=0.0)
+    return header_rect_top(figure)
 
 
 def plot_grid(points, benchmarks, value, error, ylabel, title, output,
@@ -291,6 +294,7 @@ def plot_grid(points, benchmarks, value, error, ylabel, title, output,
     figure.align_ylabels()
     top = draw_header(figure, handles, title, with_legend=inset is None)
     figure.tight_layout(rect=(0, 0, 1, top), pad=0.1, h_pad=0.6, w_pad=1.0)
+    fit_below_header(figure)
     save_figure(figure, output)
     plt.close(figure)
 
