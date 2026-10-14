@@ -88,6 +88,76 @@ end
     @test PolymerPIM.stat_vertical_fusions() - fused == 0
 end
 
+# The runtime only declines to merge, so the lowering splits the tree itself.
+@testset "an expression wider than the operand table splits" begin
+    n = 512
+    k = MAX_VFUSE_INPUTS + 5
+    data = [Int32.(collect(1:n) .+ d) for d in 1:k]
+    vs = [DPUVector(copy(d)) for d in data]
+    q = Int32.(collect(1:k))
+    want = sum(data[d] .* q[d] for d in 1:k)
+
+    dot(vecs) = foldl((acc, d) -> acc .+ vecs[d] .* q[d], 2:k;
+                      init = vecs[1] .* q[1])
+
+    PolymerPIM.sync()
+    before = PolymerPIM.stat_compute_launches()
+    got = Array(dot(vs))
+    passes = PolymerPIM.stat_compute_launches() - before
+
+    @test got == want
+    # One cut: the table's worth in the first program, the rest in the second.
+    @test passes == 2
+
+    # The same through a reduction terminal, which is vector_search's shape.
+    PolymerPIM.sync()
+    before = PolymerPIM.stat_compute_launches()
+    value, index = findmax(dot(vs))
+    PolymerPIM.sync()
+
+    @test value == maximum(want)
+    @test index == argmax(want)
+    @test PolymerPIM.stat_compute_launches() - before == 2
+end
+
+# Wide enough to cut twice, which is where a nested lowering could release an
+# intermediate the enclosing program still reads.
+@testset "an expression wide enough to cut twice" begin
+    n = 512
+    k = 2 * (MAX_VFUSE_INPUTS + 1) + 2
+    data = [Int32.(collect(1:n) .+ d) for d in 1:k]
+    vs = [DPUVector(copy(d)) for d in data]
+    q = Int32.(collect(1:k))
+    want = sum(data[d] .* q[d] for d in 1:k)
+
+    PolymerPIM.sync()
+    before = PolymerPIM.stat_compute_launches()
+    got = Array(foldl((acc, d) -> acc .+ vs[d] .* q[d], 2:k;
+                      init = vs[1] .* q[1]))
+    passes = PolymerPIM.stat_compute_launches() - before
+
+    @test got == want
+    @test passes == 3
+end
+
+# The GC cannot see MRAM, so an unreleased cut result accumulates until the
+# DPUs are full -- vector_search died at query 48 of 60 that way.
+@testset "split intermediates are released" begin
+    n = 512
+    k = MAX_VFUSE_INPUTS + 5
+    vs = [DPUVector(Int32.(collect(1:n) .+ d)) for d in 1:k]
+    q = Int32.(collect(1:k))
+    dot(vecs) = foldl((acc, d) -> acc .+ vecs[d] .* q[d], 2:k;
+                      init = vecs[1] .* q[1])
+
+    for _ in 1:8
+        findmax(dot(vs))
+        @test length(PolymerPIM._CUT_TEMPS) <= 1   # one expression's worth
+    end
+    PolymerPIM.sync()
+    @test isempty(PolymerPIM._CUT_TEMPS)
+end
+
 @testset "in-place broadcast writes through" begin
     n = 512
     av = Int32.(collect(1:n)); bv = Int32.(collect(n:-1:1))

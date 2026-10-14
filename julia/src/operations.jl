@@ -214,7 +214,8 @@ function _leaf(v::DPUVector, st::_Lowering)
         o === v && return operand(i)
     end
     length(st.operands) + 1 <= MAX_VFUSE_INPUTS || throw(ArgumentError(
-        "broadcast needs more than $MAX_VFUSE_INPUTS operand slots; split it"))
+        "expression needs more than $MAX_VFUSE_INPUTS operand slots; running a " *
+        "broadcast splits it, inspecting one does not"))
     push!(st.operands, v)
     return operand(length(st.operands))
 end
@@ -292,6 +293,7 @@ end
 @noinline function _lower_tree(bc::Base.Broadcast.Broadcasted;
                                consume::Bool = true)
     bc = _capture_scalars(bc)
+    consume && (bc = _split_to_fit(bc))
     st = _Lowering()
     e = _lower(bc, st)
     st.primary === nothing &&
@@ -420,6 +422,114 @@ const _Lane = Union{DPUVector,DpuLazy}
 # An operand slot needs a real vector; anything else passes through.
 _force(x) = x
 _force(x::DpuLazy) = DPUVector(x)
+
+# ---- splitting an expression too wide for the operand table ----
+#
+# The runtime only declines to merge, never cuts: a chain of statements is
+# already legal unfused.  A tree arrives as one program, so cutting one that
+# needs more vectors than the table holds has to happen here.
+
+const _MAX_PROGRAM_VECTORS = MAX_VFUSE_INPUTS + 1   # the primary holds slot 0
+
+# A subtree and the vectors it reads, by identity as `_leaf` matches them.
+struct _Fitted
+    node::Any
+    vecs::Base.IdSet{Any}
+end
+
+_vecs!(seen, ::Any) = nothing
+_vecs!(seen, v::DPUVector) = (push!(seen, v); nothing)
+_vecs!(seen, x::DpuLazy) =
+    x.forced === nothing ? _vecs!(seen, x.bc) : _vecs!(seen, x.forced)
+_vecs!(seen, bc::Base.Broadcast.Broadcasted) =
+    (foreach(a -> _vecs!(seen, a), bc.args); nothing)
+
+_vecs(x) = (seen = Base.IdSet{Any}(); _vecs!(seen, x); seen)
+
+_fits(vecs) = length(vecs) <= _MAX_PROGRAM_VECTORS
+
+function _all_vecs(parts)
+    vecs = Base.IdSet{Any}()
+    for p in parts
+        union!(vecs, p.vecs)
+    end
+    return vecs
+end
+
+# A cut result reaches no caller, so the GC never sees the MRAM it holds and a
+# query loop exhausts the DPUs.  Released once the next expression is lowered:
+# by then the program reading it is submitted, which is where C++ drops its own
+# handle.  `release!` only decrements the handle count, so a queued reader is
+# unaffected.
+const _CUT_TEMPS = DPUVector[]
+
+function _release_cut_temps!()
+    for v in _CUT_TEMPS
+        release!(v)
+    end
+    empty!(_CUT_TEMPS)
+    return nothing
+end
+
+# Run a subtree now, so what encloses it reads one vector instead of many.
+function _cut(bc::Base.Broadcast.Broadcasted)
+    e, primary, operands, scalars = _lower_tree(bc)
+    v = Internal.dpu_pipeline(primary, e; operands = operands,
+                              scalars = scalars)
+    push!(_CUT_TEMPS, v)
+    return v
+end
+
+# Cut the tree, not the wrapper: forcing it would hand the caller a vector we
+# are about to release.  It is folded into the cut program, so mark it consumed
+# or `sync()` runs it a second time.
+function _cut(x::DpuLazy)
+    v = _cut(x.bc)
+    x.consumed = true
+    x.uses += 1
+    return v
+end
+
+_fit(x) = _Fitted(x, _vecs(x))
+
+# A statement chain wraps each step in a lazy value and the lowering inlines
+# those, so this must too -- otherwise every wrapper reads as its own cut point.
+function _fit(x::DpuLazy)
+    x.forced === nothing || return _fit(x.forced)
+    fitted = _fit(x.bc)
+    x.bc = fitted.node
+    return _Fitted(x, fitted.vecs)
+end
+
+function _fit(bc::Base.Broadcast.Broadcasted{Style}) where {Style}
+    parts = _Fitted[_fit(a) for a in bc.args]
+    vecs = _all_vecs(parts)
+    # Widest first, so each program spent buys back the most slots.
+    for i in sortperm(parts; by = p -> length(p.vecs), rev = true)
+        _fits(vecs) && break
+        length(parts[i].vecs) > 1 || break   # sorted, so the rest are leaves
+        cut = _cut(parts[i].node)
+        parts[i] = _Fitted(cut, _vecs(cut))
+        vecs = _all_vecs(parts)
+    end
+    args = ntuple(i -> parts[i].node, length(parts))
+    return _Fitted(Base.Broadcast.Broadcasted{Style}(bc.f, args, bc.axes), vecs)
+end
+
+const _SPLIT_DEPTH = Ref(0)
+
+# One walk when it already fits, which is the usual case.
+function _split_to_fit(bc::Base.Broadcast.Broadcasted)
+    # Nested calls come from `_cut`; releasing there would drop an intermediate
+    # before the program that reads it has been submitted.
+    _SPLIT_DEPTH[] == 0 && _release_cut_temps!()
+    _SPLIT_DEPTH[] += 1
+    try
+        return _fits(_vecs(bc)) ? bc : _fit(bc).node
+    finally
+        _SPLIT_DEPTH[] -= 1
+    end
+end
 
 # Operators on an unrun expression keep it unrun.  On a DPUVector they stay
 # eager: `a + b` is a statically compiled kernel.
