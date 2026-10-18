@@ -8,12 +8,6 @@
 #include "perfetto/trace.h"
 #include "vector_desc.h"
 
-#ifndef DPURT
-#define DPURT
-#include <dpu>  // UPMEM rt syslib
-#define CHECK_UPMEM(x) DPU_ASSERT(x)
-#endif
-
 namespace detail {
 VectorDesc::~VectorDesc() {
   auto& runtime = DpuRuntime::get();
@@ -33,261 +27,103 @@ VectorDesc::~VectorDesc() {
 #endif
   }
   if (ptr_allocated) {
-    runtime.get_allocator().deallocate_upmem_vector(this);
+    runtime.backend().release(*this);
   }
-}
-
-template <typename T>
-bool all_identical(const T* arr, size_t n) {
-  for (size_t i = 1; i < n; i++) {
-    if (std::memcmp(&arr[0], &arr[i], sizeof(T)) != 0) return false;
-  }
-  return true;
 }
 
 void vec_xfer_to_dpu(char* cpu, VectorDescRef desc) {
-  auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(desc);
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-
-  uint32_t idx_dpu = 0;
-  size_t element = 0;
-
-  DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-    CHECK_UPMEM(dpu_prepare_xfer(dpu, &(cpu[element])));
-    element += desc->desc[idx_dpu].size_bytes - desc->reserved_bytes;
-  }
-
-  uint32_t mram_location = desc->desc[0].ptr;
-  size_t xfer_size = desc->desc[0].allocated_bytes - desc->reserved_bytes;
   trace::scoped_event trace_scoped("transfer", "vec_xfer_to_dpu");
-  CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU,
-                            DPU_MRAM_HEAP_POINTER_NAME, mram_location,
-                            xfer_size, DPU_XFER_ASYNC));
+  DpuRuntime::get().backend().write(desc, cpu);
 }
 
 // Reads every shard into `cpu` at a uniform `stride`.  The caller must have
 // sized `cpu` for stride * num_dpus, since one transfer size applies to the
 // whole DPU set; see ShardLayout.
 void vec_xfer_from_dpu_strided(char* cpu, VectorDescRef desc, size_t stride) {
-  auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(desc);
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-
-  uint32_t idx_dpu = 0;
-  DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-    CHECK_UPMEM(dpu_prepare_xfer(dpu, &(cpu[(size_t)idx_dpu * stride])));
-  }
-
   trace::scoped_event trace_scoped("transfer", "vec_xfer_from_dpu");
-  CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU,
-                            DPU_MRAM_HEAP_POINTER_NAME, desc->desc[0].ptr,
-                            stride, DPU_XFER_ASYNC));
+  DpuRuntime::get().backend().read(desc, cpu, stride);
 }
+
+namespace {
+DpuBackend::InspectArgs log_launch_args() {
+#if ENABLE_DPU_LOGGING >= 1
+  return [](const DPU_LAUNCH_ARGS* args, uint32_t nr_of_dpus) {
+    log_dpu_launch_args(DpuRuntime::get().get_logger(), args, nr_of_dpus);
+  };
+#else
+  return {};
+#endif
+}
+}  // namespace
 
 void internal_launch_binary_scalar(VectorDescRef res, VectorDescRef lhs,
                                    uint32_t scalar, KernelID kernel_id) {
-  auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(res);
-  runtime.get_allocator().realize_allocation(lhs);
-
-  uint32_t nr_of_dpus = runtime.num_dpus();
-  DPU_LAUNCH_ARGS args[nr_of_dpus] = {};
-
-  for (uint32_t i = 0; i < nr_of_dpus; i++) {
-    args[i].kernel = static_cast<uint32_t>(kernel_id);
-    args[i].ktype = static_cast<uint8_t>(KERNEL_BINARY_SCALAR);
-    args[i].num_elements = lhs->desc[i].size_bytes / lhs->element_size;
-    args[i].size_type = lhs->element_size;
-    args[i].binary_scalar.lhs_offset = (lhs->desc[i].ptr);
-    args[i].binary_scalar.rhs_scalar = scalar;
-    args[i].binary_scalar.res_offset = (res->desc[i].ptr);
-  }
-
-#if ENABLE_DPU_LOGGING >= 1
-  Logger& logger = DpuRuntime::get().get_logger();
-  log_dpu_launch_args(logger, args, nr_of_dpus);
-#endif
-
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-  uint32_t idx_dpu = 0;
-
-  if (all_identical(args, nr_of_dpus)) {
-    CHECK_UPMEM(dpu_broadcast_to(dpu_set, "args", 0, &args[0], sizeof(args[0]),
-                                 DPU_XFER_DEFAULT));
-  } else {
-    DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-      CHECK_UPMEM(dpu_prepare_xfer(dpu, &args[idx_dpu]));
-    }
-    CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "args", 0,
-                              sizeof(args[0]), DPU_XFER_DEFAULT));
-  }
-  CHECK_UPMEM(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
+  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+    args = {};
+    args.kernel = static_cast<uint32_t>(kernel_id);
+    args.ktype = static_cast<uint8_t>(KERNEL_BINARY_SCALAR);
+    args.num_elements = s.size_bytes(*lhs) / lhs->element_size;
+    args.size_type = lhs->element_size;
+    args.binary_scalar.lhs_offset = s.offset(*lhs);
+    args.binary_scalar.rhs_scalar = scalar;
+    args.binary_scalar.res_offset = s.offset(*res);
+  };
+  DpuRuntime::get().backend().launch({res, lhs}, fill, log_launch_args());
 }
 
 void internal_launch_fill(VectorDescRef res, uint32_t value,
                           KernelID kernel_id) {
-  auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(res);
-
-  uint32_t nr_of_dpus = runtime.num_dpus();
-  DPU_LAUNCH_ARGS args[nr_of_dpus] = {};
-
-  for (uint32_t i = 0; i < nr_of_dpus; i++) {
-    args[i].kernel = static_cast<uint32_t>(kernel_id);
-    args[i].ktype = static_cast<uint8_t>(KERNEL_FILL);
-    args[i].num_elements = res->desc[i].size_bytes / res->element_size;
-    args[i].size_type = res->element_size;
-    args[i].binary_scalar.lhs_offset = 0;
-    args[i].binary_scalar.rhs_scalar = value;
-    args[i].binary_scalar.res_offset = (res->desc[i].ptr);
-  }
-
-#if ENABLE_DPU_LOGGING >= 1
-  Logger& logger = DpuRuntime::get().get_logger();
-  log_dpu_launch_args(logger, args, nr_of_dpus);
-#endif
-
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-  uint32_t idx_dpu = 0;
-
-  if (all_identical(args, nr_of_dpus)) {
-    CHECK_UPMEM(dpu_broadcast_to(dpu_set, "args", 0, &args[0], sizeof(args[0]),
-                                 DPU_XFER_DEFAULT));
-  } else {
-    DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-      CHECK_UPMEM(dpu_prepare_xfer(dpu, &args[idx_dpu]));
-    }
-    CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "args", 0,
-                              sizeof(args[0]), DPU_XFER_DEFAULT));
-  }
-  CHECK_UPMEM(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
+  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+    args = {};
+    args.kernel = static_cast<uint32_t>(kernel_id);
+    args.ktype = static_cast<uint8_t>(KERNEL_FILL);
+    args.num_elements = s.size_bytes(*res) / res->element_size;
+    args.size_type = res->element_size;
+    args.binary_scalar.lhs_offset = 0;
+    args.binary_scalar.rhs_scalar = value;
+    args.binary_scalar.res_offset = s.offset(*res);
+  };
+  DpuRuntime::get().backend().launch({res}, fill, log_launch_args());
 }
 
 void internal_launch_binary(VectorDescRef res, VectorDescRef lhs,
                             VectorDescRef rhs, KernelID kernel_id) {
-  auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(res);
-  runtime.get_allocator().realize_allocation(lhs);
-  runtime.get_allocator().realize_allocation(rhs);
-
-  uint32_t nr_of_dpus = runtime.num_dpus();
-  DPU_LAUNCH_ARGS args[nr_of_dpus];
-
-  for (uint32_t i = 0; i < nr_of_dpus; i++) {
-    args[i].kernel = static_cast<uint32_t>(kernel_id);
-    args[i].ktype = static_cast<uint8_t>(KERNEL_BINARY);
-    args[i].num_elements = rhs->desc[i].size_bytes / rhs->element_size;
-    args[i].size_type = rhs->element_size;
-    args[i].binary.lhs_offset = (lhs->desc[i].ptr);
-    args[i].binary.rhs_offset = (rhs->desc[i].ptr);
-    args[i].binary.res_offset = (res->desc[i].ptr);
-  }
-
-#if ENABLE_DPU_LOGGING >= 1
-  Logger& logger = DpuRuntime::get().get_logger();
-  log_dpu_launch_args(logger, args, nr_of_dpus);
-#endif
-
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-  uint32_t idx_dpu = 0;
-
-  if (all_identical(args, nr_of_dpus)) {
-    CHECK_UPMEM(dpu_broadcast_to(dpu_set, "args", 0, &args[0], sizeof(args[0]),
-                                 DPU_XFER_DEFAULT));
-  } else {
-    DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-      CHECK_UPMEM(dpu_prepare_xfer(dpu, &args[idx_dpu]));
-    }
-    CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "args", 0,
-                              sizeof(args[0]), DPU_XFER_DEFAULT));
-  }
-  CHECK_UPMEM(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
+  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+    args.kernel = static_cast<uint32_t>(kernel_id);
+    args.ktype = static_cast<uint8_t>(KERNEL_BINARY);
+    args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
+    args.size_type = rhs->element_size;
+    args.binary.lhs_offset = s.offset(*lhs);
+    args.binary.rhs_offset = s.offset(*rhs);
+    args.binary.res_offset = s.offset(*res);
+  };
+  DpuRuntime::get().backend().launch({res, lhs, rhs}, fill, log_launch_args());
 }
 
 void internal_launch_unary(VectorDescRef res, VectorDescRef rhs,
                            KernelID kernel_id) {
-  auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(res);
-  runtime.get_allocator().realize_allocation(rhs);
-
-  uint32_t nr_of_dpus = runtime.num_dpus();
-  DPU_LAUNCH_ARGS args[nr_of_dpus];
-
-  for (uint32_t i = 0; i < nr_of_dpus; i++) {
-    args[i].kernel = static_cast<uint32_t>(kernel_id);
-    args[i].ktype = static_cast<uint8_t>(KERNEL_PIPELINE);
-    args[i].num_elements = rhs->desc[i].size_bytes / rhs->element_size;
-    args[i].size_type = rhs->element_size;
-    args[i].unary.rhs_offset = (rhs->desc[i].ptr);
-    args[i].unary.res_offset = (res->desc[i].ptr);
-  }
-
-#if ENABLE_DPU_LOGGING >= 1
-  Logger& logger = DpuRuntime::get().get_logger();
-  log_dpu_launch_args(logger, args, nr_of_dpus);
-#endif
-
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-  uint32_t idx_dpu = 0;
-
-  if (all_identical(args, nr_of_dpus)) {
-    CHECK_UPMEM(dpu_broadcast_to(dpu_set, "args", 0, &args[0], sizeof(args[0]),
-                                 DPU_XFER_DEFAULT));
-  } else {
-    DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-      CHECK_UPMEM(dpu_prepare_xfer(dpu, &args[idx_dpu]));
-    }
-    CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "args", 0,
-                              sizeof(args[0]), DPU_XFER_DEFAULT));
-  }
-  CHECK_UPMEM(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
+  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+    args.kernel = static_cast<uint32_t>(kernel_id);
+    args.ktype = static_cast<uint8_t>(KERNEL_PIPELINE);
+    args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
+    args.size_type = rhs->element_size;
+    args.unary.rhs_offset = s.offset(*rhs);
+    args.unary.res_offset = s.offset(*res);
+  };
+  DpuRuntime::get().backend().launch({res, rhs}, fill, log_launch_args());
 }
 
 void internal_launch_reduction(VectorDescRef res, VectorDescRef rhs,
                                KernelID kernel_id) {
-  auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(res);
-  runtime.get_allocator().realize_allocation(rhs);
-
-  uint32_t nr_of_dpus = runtime.num_dpus();
-  DPU_LAUNCH_ARGS args[nr_of_dpus];
-
-  for (uint32_t i = 0; i < nr_of_dpus; i++) {
-    args[i].kernel = static_cast<uint32_t>(kernel_id);
-    args[i].ktype = static_cast<uint8_t>(KERNEL_REDUCTION);
-    args[i].num_elements = rhs->desc[i].size_bytes / rhs->element_size;
-    args[i].size_type = rhs->element_size;
-    args[i].reduction.rhs_offset = (rhs->desc[i].ptr);
-    args[i].reduction.res_offset = (res->desc[i].ptr);
-  }
-
-#if ENABLE_DPU_LOGGING >= 1
-  Logger& logger = DpuRuntime::get().get_logger();
-  log_dpu_launch_args(logger, args, nr_of_dpus);
-#endif
-
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-  uint32_t idx_dpu = 0;
-
-  if (all_identical(args, nr_of_dpus)) {
-    CHECK_UPMEM(dpu_broadcast_to(dpu_set, "args", 0, &args[0], sizeof(args[0]),
-                                 DPU_XFER_DEFAULT));
-  } else {
-    DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-      CHECK_UPMEM(dpu_prepare_xfer(dpu, &args[idx_dpu]));
-    }
-    CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "args", 0,
-                              sizeof(args[0]), DPU_XFER_DEFAULT));
-  }
-  CHECK_UPMEM(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
+  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+    args.kernel = static_cast<uint32_t>(kernel_id);
+    args.ktype = static_cast<uint8_t>(KERNEL_REDUCTION);
+    args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
+    args.size_type = rhs->element_size;
+    args.reduction.rhs_offset = s.offset(*rhs);
+    args.reduction.res_offset = s.offset(*res);
+  };
+  DpuRuntime::get().backend().launch({res, rhs}, fill, log_launch_args());
 }
 
 #if PIPELINE
@@ -298,115 +134,92 @@ void internal_launch_universal_pipeline(
     const std::vector<uint32_t>& extra_scalars,
     const std::vector<VectorDescRef>& extra_outputs,
     std::string_view kernel_hash) {
-  auto& runtime = DpuRuntime::get();
-  if (res) runtime.get_allocator().realize_allocation(res);
-  if (init) runtime.get_allocator().realize_allocation(init);
-  for (auto& op : operands) {
-    if (op) runtime.get_allocator().realize_allocation(op);
-  }
-  for (auto& out : extra_outputs) {
-    if (out) runtime.get_allocator().realize_allocation(out);
-  }
-  uint32_t nr_of_dpus = runtime.num_dpus();
-  DPU_LAUNCH_ARGS args[nr_of_dpus];
+#if !JIT
+  // The interpreter reads args.pipeline.ops, which is MAX_VFUSE_OPS long.
+  // Truncating here would silently drop the tail of the program, so fail
+  // loudly instead -- every path that builds an RPN is supposed to bound it.
+  if (ops.size() > MAX_VFUSE_OPS)
+    throw std::runtime_error("RPN program of " + std::to_string(ops.size()) +
+                             " opcodes exceeds MAX_VFUSE_OPS (" +
+                             std::to_string(MAX_VFUSE_OPS) +
+                             "); rebuild with JIT=1 or raise MAX_VFUSE_OPS");
+#endif
 
-  // Accumulated, not i * stride: shard sizes can be ragged.
-  uint32_t index_base = 0;
+  std::vector<VectorDescRef> vectors = {res, init};
+  vectors.insert(vectors.end(), operands.begin(), operands.end());
+  vectors.insert(vectors.end(), extra_outputs.begin(), extra_outputs.end());
 
-  for (uint32_t i = 0; i < nr_of_dpus; i++) {
-    args[i].kernel = static_cast<uint32_t>(kernel_id);
-    args[i].ktype = static_cast<uint8_t>(KERNEL_UNARY);
+  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+    args.kernel = static_cast<uint32_t>(kernel_id);
+    args.ktype = static_cast<uint8_t>(KERNEL_UNARY);
 
-    args[i].num_elements =
-        init ? (init->desc[i].size_bytes / init->element_size) : 0;
-    args[i].size_type =
-        init ? init->element_size : (res ? res->element_size : 4);
+    args.num_elements = init ? (s.size_bytes(*init) / init->element_size) : 0;
+    args.size_type = init ? init->element_size : (res ? res->element_size : 4);
 
-    args[i].pipeline.init_offset = init ? init->desc[i].ptr : 0;
-    args[i].pipeline.res_offset = res ? res->desc[i].ptr : 0;
-    args[i].pipeline.index_base = index_base;
-    index_base += args[i].num_elements;
+    args.pipeline.init_offset = init ? s.offset(*init) : 0;
+    args.pipeline.res_offset = res ? s.offset(*res) : 0;
+    args.pipeline.index_base = init ? s.first_element(*init) : 0;
 
     for (size_t j = 0; j < MAX_HFUSE_CHAINS; ++j) {
       if (j < extra_outputs.size()) {
-        args[i].pipeline.extra_res_offsets[j] = extra_outputs[j]->desc[i].ptr;
-        args[i].pipeline.local_sizes[j] = extra_outputs[j]->num_elements;
-        args[i].pipeline.local_reduce_ops[j] =
+        args.pipeline.extra_res_offsets[j] = s.offset(*extra_outputs[j]);
+        args.pipeline.local_sizes[j] = extra_outputs[j]->num_elements;
+        args.pipeline.local_reduce_ops[j] =
             extra_outputs[j]->local_reduce_opcode;
       } else {
-        args[i].pipeline.extra_res_offsets[j] = 0;
-        args[i].pipeline.local_sizes[j] = 0;
-        args[i].pipeline.local_reduce_ops[j] = OP_SUM;
+        args.pipeline.extra_res_offsets[j] = 0;
+        args.pipeline.local_sizes[j] = 0;
+        args.pipeline.local_reduce_ops[j] = OP_SUM;
       }
     }
 
-#if !JIT
-    // The interpreter reads args.pipeline.ops, which is MAX_VFUSE_OPS long.
-    // Truncating here would silently drop the tail of the program, so fail
-    // loudly instead -- every path that builds an RPN is supposed to bound it.
-    if (ops.size() > MAX_VFUSE_OPS)
-      throw std::runtime_error("RPN program of " + std::to_string(ops.size()) +
-                               " opcodes exceeds MAX_VFUSE_OPS (" +
-                               std::to_string(MAX_VFUSE_OPS) +
-                               "); rebuild with JIT=1 or raise MAX_VFUSE_OPS");
-#endif
-    args[i].pipeline.num_ops =
-        std::min((size_t)ops.size(), (size_t)MAX_VFUSE_OPS);
+    args.pipeline.num_ops = std::min((size_t)ops.size(), (size_t)MAX_VFUSE_OPS);
 
-    for (size_t j = 0; j < args[i].pipeline.num_ops; ++j) {
-      args[i].pipeline.ops[j] = ops[j];
+    for (size_t j = 0; j < args.pipeline.num_ops; ++j) {
+      args.pipeline.ops[j] = ops[j];
     }
 
     // Map operands by index (0..MAX_VFUSE_INPUTS-1)
     for (size_t j = 0; j < MAX_VFUSE_INPUTS; ++j) {
       if (j < operands.size()) {
-        args[i].pipeline.binary_operands[j] = operands[j]->desc[i].ptr;
+        args.pipeline.binary_operands[j] = s.offset(*operands[j]);
       } else {
-        args[i].pipeline.binary_operands[j] = 0;
+        args.pipeline.binary_operands[j] = 0;
       }
     }
 
     // Map scalar arguments
     for (size_t j = 0; j < MAX_PIPELINE_SCALARS; ++j) {
       if (j < scalars.size()) {
-        args[i].pipeline.scalars[j] = scalars[j];
+        args.pipeline.scalars[j] = scalars[j];
       } else {
-        args[i].pipeline.scalars[j] = 0;
+        args.pipeline.scalars[j] = 0;
       }
     }
 
     // Map extra JIT scalars
     for (size_t j = 0; j < 8; ++j) {
       if (j < extra_scalars.size()) {
-        args[i].pipeline.extra_scalars[j] = extra_scalars[j];
+        args.pipeline.extra_scalars[j] = extra_scalars[j];
       } else {
-        args[i].pipeline.extra_scalars[j] = 0;
+        args.pipeline.extra_scalars[j] = 0;
       }
     }
-  }
+  };
 
+  DpuBackend::InspectArgs inspect;
 #if ENABLE_DPU_LOGGING >= 1
-  Logger& logger = DpuRuntime::get().get_logger();
-  detail::FusionRpnSummary rpn_summary = detail::summarize_fusion_rpn(ops);
-  log_dpu_launch_args(logger, args, nr_of_dpus, rpn_summary.decoded_ops,
-                      rpn_summary.chains, kernel_hash);
+  inspect = [&](const DPU_LAUNCH_ARGS* args, uint32_t nr_of_dpus) {
+    detail::FusionRpnSummary rpn_summary = detail::summarize_fusion_rpn(ops);
+    log_dpu_launch_args(DpuRuntime::get().get_logger(), args, nr_of_dpus,
+                        rpn_summary.decoded_ops, rpn_summary.chains,
+                        kernel_hash);
+  };
+#else
+  (void)kernel_hash;
 #endif
 
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  dpu_set_t dpu;
-  uint32_t idx_dpu = 0;
-
-  if (all_identical(args, nr_of_dpus)) {
-    CHECK_UPMEM(dpu_broadcast_to(dpu_set, "args", 0, &args[0], sizeof(args[0]),
-                                 DPU_XFER_DEFAULT));
-  } else {
-    DPU_FOREACH(dpu_set, dpu, idx_dpu) {
-      CHECK_UPMEM(dpu_prepare_xfer(dpu, &args[idx_dpu]));
-    }
-    CHECK_UPMEM(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "args", 0,
-                              sizeof(args[0]), DPU_XFER_DEFAULT));
-  }
-  CHECK_UPMEM(dpu_launch(dpu_set, DPU_ASYNCHRONOUS));
+  DpuRuntime::get().backend().launch(vectors, fill, inspect);
 }
 #endif
 

@@ -39,8 +39,7 @@ dpu_vector<T>::dpu_vector(size_t n, uint32_t reserved, bool lazy,
   if (runtime.is_initialized() == false) {
     runtime.init(DpuRuntime::configured_num_dpus());
   }
-  data_ = runtime.get_allocator().allocate_upmem_vector(n, reserved, sizeof(T),
-                                                        lazy);
+  data_ = runtime.backend().allocate(n, reserved, sizeof(T), lazy);
   data_->type_name = typeid(T).name();
   data_->debug_name = debug_name;
   data_->debug_file = debug_file;
@@ -175,7 +174,7 @@ dpu_vector<T> dpu_vector<T>::from_cpu(std::vector<T>& cpu_vec,
 template <typename T>
 vector<T> dpu_vector<T>::to_cpu() {
   auto desc = this->data_desc_ref();
-  DpuRuntime::get().get_allocator().realize_allocation(desc);
+  DpuRuntime::get().backend().realize(desc);
   const size_t result_elems =
       detail::shard_layout(*desc).total_logical / sizeof(T);
 
@@ -188,7 +187,7 @@ template <typename T>
 size_t dpu_vector<T>::to_cpu_into(T* out, size_t capacity) {
   auto desc = this->data_desc_ref();
   auto& runtime = DpuRuntime::get();
-  runtime.get_allocator().realize_allocation(desc);
+  runtime.backend().realize(desc);
 
   // One transfer size applies to every DPU, so ragged shards have to land in a
   // padded staging buffer and be compacted afterwards.  When every shard's
@@ -1069,7 +1068,7 @@ dpu_local_vector<T>::dpu_local_vector(uint32_t n, dpu_local_reduce_op reduce_op,
                                       std::source_location loc)
     : size_(n), reduce_op_(reduce_op) {
   auto& runtime = DpuRuntime::get();
-  data_ = runtime.get_allocator().allocate_local_vector(n, sizeof(T));
+  data_ = runtime.backend().allocate_local(n, sizeof(T));
   data_->is_local_vector = true;
   data_->local_reduce_opcode = detail::local_reduce_opcode(reduce_op_);
   data_->type_name = typeid(T).name();

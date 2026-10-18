@@ -23,12 +23,6 @@
 #include <sstream>
 #include <thread>
 
-#ifndef DPURT
-#define DPURT
-#include <dpu>  // UPMEM rt syslib
-#define CHECK_UPMEM(x) DPU_ASSERT(x)
-#endif
-
 using detail::compile_kernel_if_unbatched;
 using detail::log_launch;
 using detail::log_next_operation;
@@ -51,9 +45,7 @@ void EventQueue::sync() {
   }
   process_events(last_id);
 
-  auto& runtime = DpuRuntime::get();
-  dpu_set_t& dpu_set = runtime.dpu_set();
-  CHECK_UPMEM(dpu_sync(dpu_set));
+  DpuRuntime::get().backend().sync();
   finalize_finished_events();
 }
 
@@ -133,14 +125,12 @@ void EventQueue::process_events(size_t wait_for_id) {
       if (operations_.empty() && running_events_.empty()) break;
     }
 
-    auto& runtime = DpuRuntime::get();
-    dpu_set_t& dpu_set = runtime.dpu_set();
 #if ENABLE_DPU_LOGGING >= 2
     logger.lock(logcat::QUEUE_WAIT, 2)
         << "dpu_sync wait_for_id=" << wait_for_id
         << " last_finished=" << this->get_last_finished_id() << std::endl;
 #endif
-    CHECK_UPMEM(dpu_sync(dpu_set));
+    DpuRuntime::get().backend().sync();
     finalize_finished_events();
 #if ENABLE_DPU_LOGGING >= 2
     logger.lock(logcat::QUEUE_WAIT, 2)
