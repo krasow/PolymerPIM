@@ -153,3 +153,58 @@ end
         @test isfile(runs)
     end
 end
+
+@testset "tuning validation" begin
+    config = load_config()
+    spec = only(config.benchmarks["elementwise"])
+    result(ms, dpus) = BenchmarkRunner.TuneResult("ok", ms, [ms], [(dpus, 64)])
+    variant(knob, value) = merge(BenchmarkRunner.DEFAULT_FUSION_BUILD,
+                                 Dict(knob => value))
+    seed = copy(BenchmarkRunner.DEFAULT_FUSION_BUILD)
+    winner = variant("MAX_VFUSE_OPS", 16)
+    runner_up = variant("MAX_VFUSE_OPS", 32)
+    key = BenchmarkRunner.config_key
+    scale = BenchmarkRunner.VALIDATION_DPUS
+
+    mktempdir() do directory
+        options = BenchmarkRunner.TuneOptions(
+            dpus = [2], elements_per_dpu = [64], warmup = 0, iterations = 1,
+            checkpoints = directory)
+        checkpoint = BenchmarkRunner.load_checkpoint(config, spec, options)
+        initial = result(100.0, 2)
+        BenchmarkRunner.record!(checkpoint, seed, initial, "initial", "", "")
+        BenchmarkRunner.record!(checkpoint, winner, result(97.0, 2), 1, "", "")
+        BenchmarkRunner.record!(checkpoint, runner_up, result(99.0, 2), 1, "", "")
+        # Cached timings at scale, so nothing is launched.
+        checkpoint.validations[key(seed)] = result(100.0, scale)
+        checkpoint.validations[key(winner)] = result(140.0, scale)
+        checkpoint.validations[key(runner_up)] = result(100.5, scale)
+        BenchmarkRunner.save_checkpoint(checkpoint)
+
+        best, chosen, summary = quietly() do
+            BenchmarkRunner.validate_winner(
+                config, spec, options, checkpoint, Ref{Any}(nothing), seed,
+                initial, winner, checkpoint.cache[key(winner)])
+        end
+        @test key(best) == key(runner_up)
+        @test chosen.objective == 99.0
+        @test summary["status"] == "fallback"
+        @test length(summary["rejected"]) == 1
+
+        checkpoint.validations[key(runner_up)] = result(120.0, scale)
+        best, chosen, summary = quietly() do
+            BenchmarkRunner.validate_winner(
+                config, spec, options, checkpoint, Ref{Any}(nothing), seed,
+                initial, winner, checkpoint.cache[key(winner)])
+        end
+        @test key(best) == key(seed)
+        @test chosen === initial
+        @test summary["status"] == "fallback_default"
+
+        resumed = BenchmarkRunner.load_checkpoint(
+            config, spec, BenchmarkRunner.TuneOptions(
+                dpus = [2], elements_per_dpu = [64], warmup = 0,
+                iterations = 1, checkpoints = directory, resume = true))
+        @test resumed.validations[key(winner)].objective == 140.0
+    end
+end

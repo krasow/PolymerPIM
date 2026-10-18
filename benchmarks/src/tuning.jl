@@ -14,6 +14,11 @@ const DEFAULT_FUSION_SEARCH = Dict(
     "MAX_VFUSE_OPS" => [1, 8, 16, 32, 64, 96, 128, 192],
 )
 
+# Winners are re-timed at scale; fusion that wins at 256 can lose 40% at 2048.
+const VALIDATION_DPUS = 2048
+const VALIDATION_TOLERANCE = 0.01
+const VALIDATION_CANDIDATES = 3
+
 const CORE_FUSION_KNOBS = (
     "QUEUE_ABSORB_LIMIT",
     "MAX_HFUSE_CHAINS",
@@ -56,6 +61,7 @@ mutable struct TuneCheckpoint
     trials::Vector{Dict{String,Any}}
     cache::Dict{Tuple,TuneResult}
     recorded::Set{Tuple}
+    validations::Dict{Tuple,TuneResult}
     complete::Bool
 end
 
@@ -100,6 +106,7 @@ function tune_usage(io::IO = stdout)
     Usage: julia tune.jl [options] [benchmark ...]
 
       --dpus N[,N...]             Representative DPU counts
+                                  (winners are re-checked at 2048 DPUs)
       --elements-per-dpu N[,N...] Override benchmark.toml sizes
       --warmup N                  Override warmup iterations
       --iterations N              Override measured iterations
@@ -228,7 +235,8 @@ tuning_sizes(spec::BenchmarkSpec, options::TuneOptions) = something(
     options.elements_per_dpu, [minimum(spec.elements_per_dpu)])
 
 function tuning_cases(spec::BenchmarkSpec, defaults::RunnerDefaults,
-                      options::TuneOptions; check::Bool = false)
+                      options::TuneOptions; check::Bool = false,
+                      dpus = options.dpus)
     sizes = tuning_sizes(spec, options)
     warmup = something(options.warmup, spec.warmup, defaults.warmup)
     iterations = something(options.iterations, spec.iterations, defaults.iterations)
@@ -236,12 +244,12 @@ function tuning_cases(spec::BenchmarkSpec, defaults::RunnerDefaults,
     # inputs in-process; every knob candidate is timed the same way.
     return [RunCase(spec.name, dpus, size, warmup, iterations, check, false,
                     something(spec.seed, defaults.seed), spec.parameters, spec.operation)
-            for dpus in options.dpus for size in sizes]
+            for dpus in dpus for size in sizes]
 end
 
 function evaluate_build(config::RunnerConfig, spec::BenchmarkSpec, build,
                         options::TuneOptions, built::Base.RefValue;
-                        check::Bool = false)
+                        check::Bool = false, dpus = options.dpus)
     key = config_key(build)
     if built[] != key
         failure = rebuild_for_tuning(config, spec.name, build, options)
@@ -252,7 +260,7 @@ function evaluate_build(config::RunnerConfig, spec::BenchmarkSpec, build,
     end
 
     times, case_ids = Float64[], Tuple{Int,Int}[]
-    for case in tuning_cases(spec, config.defaults, options; check)
+    for case in tuning_cases(spec, config.defaults, options; check, dpus)
         println("[fusion] run $(spec.name): $(case.dpus) DPUs × ",
                 "$(case.elements_per_dpu) elements/DPU")
         if check && is_implemented(config, config.variants["cpu"], case)
@@ -324,6 +332,7 @@ function checkpoint_signature(config::RunnerConfig, spec::BenchmarkSpec,
         "iterations" => something(options.iterations, spec.iterations,
                                    config.defaults.iterations),
         "passes" => options.passes,
+        "validation_dpus" => VALIDATION_DPUS,
         "check" => options.check,
         "search" => options.search,
         "workspace_profiles" => ["$a:$b" for (a, b) in options.workspace_profiles],
@@ -347,6 +356,7 @@ function load_checkpoint(config::RunnerConfig, spec::BenchmarkSpec,
     path = joinpath(options.checkpoints, spec.name * ".toml")
     signature = checkpoint_signature(config, spec, options)
     trials, cache = Dict{String,Any}[], Dict{Tuple,TuneResult}()
+    validations = Dict{Tuple,TuneResult}()
     complete = false
     loaded = options.resume && isfile(path)
     if loaded
@@ -375,10 +385,15 @@ function load_checkpoint(config::RunnerConfig, spec::BenchmarkSpec,
                 result = trial_result(trial)
                 result.status == "ok" && (cache[config_key(build)] = result)
             end
+            for trial in get(raw, "validations", Dict{String,Any}[])
+                build = Dict(knob => Int(trial["build"][knob])
+                             for knob in FUSION_BUILD_KNOBS)
+                validations[config_key(build)] = trial_result(trial)
+            end
         end
     end
     checkpoint = TuneCheckpoint(path, spec.name, signature, trials, cache,
-                                Set(keys(cache)), complete)
+                                Set(keys(cache)), validations, complete)
     loaded || save_checkpoint(checkpoint)
     return checkpoint
 end
@@ -423,10 +438,25 @@ function save_checkpoint(checkpoint::TuneCheckpoint)
                             "benchmark" => checkpoint.benchmark,
                             "complete" => checkpoint.complete,
                             "signature" => checkpoint.signature,
-                            "trials" => checkpoint.trials))
+                            "trials" => checkpoint.trials,
+                            "validations" => [
+                                validation_trial(key, result) for (key, result)
+                                in sort!(collect(checkpoint.validations);
+                                         by = first)]))
     end
     mv(temporary, checkpoint.path; force = true)
     save_checkpoint_csv(checkpoint)
+end
+
+function validation_trial(key, result::TuneResult)
+    trial = Dict{String,Any}(
+        "status" => result.status,
+        "build" => Dict(zip(FUSION_BUILD_KNOBS, key)),
+        "times_ms" => result.times,
+        "cases" => ["$(d)x$(n)" for (d, n) in result.cases],
+    )
+    isfinite(result.objective) && (trial["objective_ms"] = result.objective)
+    return trial
 end
 
 function record!(checkpoint::TuneCheckpoint, build, result::TuneResult,
@@ -449,7 +479,8 @@ function record!(checkpoint::TuneCheckpoint, build, result::TuneResult,
     return true
 end
 
-function write_profile(path, config, spec, build, initial, best, options, verified)
+function write_profile(path, config, spec, build, initial, best, options, verified,
+                       validation)
     case_times = Dict("$(case[1])x$(case[2])" => round(time; digits = 6)
                       for (case, time) in zip(best.cases, best.times))
     measurement = Dict{String,Any}(
@@ -465,6 +496,7 @@ function write_profile(path, config, spec, build, initial, best, options, verifi
         "iterations" => something(options.iterations, spec.iterations,
                                   config.defaults.iterations),
         "passes" => options.passes,
+        "validation" => validation,
     )
     document = Dict("version" => 1, "benchmark" => spec.name,
                     "tuned_at" => Dates.format(now(UTC), "yyyy-mm-ddTHH:MM:SSZ"),
@@ -478,6 +510,70 @@ function write_profile(path, config, spec, build, initial, best, options, verifi
     end
     mv(temporary, path; force = true)
 end
+
+# Keep the best tuning-count candidate that does not regress at VALIDATION_DPUS.
+function validate_winner(config::RunnerConfig, spec::BenchmarkSpec,
+                         options::TuneOptions, checkpoint::TuneCheckpoint,
+                         built::Base.RefValue, seed, initial::TuneResult,
+                         best, result::TuneResult)
+    summary = Dict{String,Any}("dpus" => VALIDATION_DPUS,
+                               "tolerance" => VALIDATION_TOLERANCE)
+    if VALIDATION_DPUS in options.dpus
+        summary["status"] = "tuned_at_validation_dpus"
+        return best, result, summary
+    end
+    seed_key = config_key(seed)
+    ranked = sort!([key for (key, trial) in checkpoint.cache
+                    if key != config_key(best) && key != seed_key &&
+                       trial.objective < initial.objective];
+                   by = key -> checkpoint.cache[key].objective)
+    seed_key == config_key(best) || pushfirst!(ranked, config_key(best))
+    if isempty(ranked)
+        summary["status"] = "default"
+        return best, result, summary
+    end
+
+    validate = function (build)
+        key = config_key(build)
+        haskey(checkpoint.validations, key) && return checkpoint.validations[key]
+        outcome = evaluate_build(config, spec, build, options, built;
+                                 dpus = [VALIDATION_DPUS])
+        checkpoint.validations[key] = outcome
+        save_checkpoint(checkpoint)
+        return outcome
+    end
+    reference = validate(seed)
+    isfinite(reference.objective) ||
+        error("default configuration failed at $VALIDATION_DPUS DPUs for $(spec.name)")
+    limit = reference.objective * (1 + VALIDATION_TOLERANCE)
+    summary["reference_ms"] = round(reference.objective; digits = 6)
+    rejected = String[]
+    for key in first(ranked, VALIDATION_CANDIDATES)
+        build = Dict(zip(FUSION_BUILD_KNOBS, key))
+        outcome = validate(build)
+        value = isfinite(outcome.objective) ?
+                round(outcome.objective; digits = 3) : outcome.status
+        println("[fusion] validate $(spec.name) $(fusion_flags_text(build)) at ",
+                "$VALIDATION_DPUS DPUs -> $value (default ",
+                round(reference.objective; digits = 3), ")")
+        if outcome.objective <= limit
+            summary["status"] = isempty(rejected) ? "accepted" : "fallback"
+            summary["objective_ms"] = round(outcome.objective; digits = 6)
+            summary["rejected"] = rejected
+            return build, checkpoint.cache[key], summary
+        end
+        push!(rejected, fusion_flags_text(build))
+    end
+    println("[fusion] validate $(spec.name): no candidate holds at ",
+            "$VALIDATION_DPUS DPUs; keeping the default")
+    summary["status"] = "fallback_default"
+    summary["objective_ms"] = summary["reference_ms"]
+    summary["rejected"] = rejected
+    return copy(seed), initial, summary
+end
+
+fusion_flags_text(build) =
+    join(("$knob=$(build[knob])" for knob in CORE_FUSION_KNOBS), ' ')
 
 function tune_target(config::RunnerConfig, spec::BenchmarkSpec, options::TuneOptions)
     checkpoint = load_checkpoint(config, spec, options)
@@ -528,6 +624,9 @@ function tune_target(config::RunnerConfig, spec::BenchmarkSpec, options::TuneOpt
         candidate.objective < result.objective && ((best, result) = (trial, candidate))
     end
 
+    best, result, validation = validate_winner(
+        config, spec, options, checkpoint, built, seed, initial, best, result)
+
     apply_failure = rebuild_for_tuning(
         config, spec.name, best, options; julia = true)
     apply_failure === nothing || error(
@@ -542,7 +641,7 @@ function tune_target(config::RunnerConfig, spec::BenchmarkSpec, options::TuneOpt
     end
 
     write_profile(profile_path, config, spec, best, initial, result, options,
-                  verified)
+                  verified, validation)
     checkpoint.complete = true
     save_checkpoint(checkpoint)
     println("[fusion] best $(spec.name): $(round(result.objective; digits = 3)) ms -> $profile_path")
