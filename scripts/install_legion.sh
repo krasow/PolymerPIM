@@ -8,10 +8,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR="${1:-${ROOT}/opt/upmem-legion}"
 LEGION_REPO="${LEGION_REPO:-git@github.com:PrescienceLab/upmem-legion.git}"
-LEGION_REV="${LEGION_REV:-c1e3202ba}"
+LEGION_REV="${LEGION_REV:-689aa9ed8}"
 
 if [[ -d "${DEST_DIR}/.git" ]]; then
-    echo "upmem-legion already installed: ${DEST_DIR}"
+    # Follow the pin when it moves.
+    if ! git -C "${DEST_DIR}" cat-file -e "${LEGION_REV}^{commit}" 2>/dev/null; then
+        git -C "${DEST_DIR}" fetch "${LEGION_REPO}"
+    fi
+    git -C "${DEST_DIR}" checkout --detach "${LEGION_REV}"
     exit 0
 elif [[ -e "${DEST_DIR}" ]]; then
     echo "Cannot install upmem-legion: ${DEST_DIR} already exists" >&2

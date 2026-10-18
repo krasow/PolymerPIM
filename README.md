@@ -32,10 +32,11 @@ each), so the requested DPU count is rounded up to whole ranks. Pass extra
 Legion flags through `POLYMERPIM_LEGION_ARGS`, for example
 `-ll:dpu_granule 256`.
 
-Only eager mode works so far: element-wise operations, scalar operations,
-fills and reductions. Kernels that need global element indices, such as
-argmin and argmax, iota and local vectors, are not supported yet. Neither are
-fusion and JIT.
+Rank memory uses upmem-legion's blocked layout (`-ll:dpu_layout blocked`), so
+each DPU holds one contiguous shard of every vector, as with the native
+runtime. Only eager mode works so far: element-wise operations, scalar
+operations, fills and reductions. Local vectors, fusion and JIT are not
+supported yet.
 
 ## C++ API
 

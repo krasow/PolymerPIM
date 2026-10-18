@@ -1,5 +1,5 @@
 // DpuBackend over Legion, using upmem-legion's Realm module: one processor and
-// one interleaved MRAM memory per rank.
+// one MRAM memory per rank.
 //
 // A vector is a 1-D logical region equally partitioned over the ranks; the
 // mapper decides where each piece's instance lives.  A kernel is an index
@@ -8,11 +8,10 @@
 // task completes once the rank drains.  Legion orders dependent launches, so
 // operations report completion as soon as they are issued.
 //
-// Within a rank, Realm interleaves each instance over the DPUs in granules.
-// Instances start on a row boundary, so a vector's shard sits at the same
-// local offset on every DPU of the rank, but the elements it holds are not a
-// contiguous range of the vector: kernels that need global indices are not
-// supported yet.
+// Rank memory uses Realm's blocked layout: each instance is split into one
+// contiguous shard per DPU, all at the same local offset, so a DPU holds a
+// contiguous range of each vector piece -- the same shape the native allocator
+// gives.
 
 #include <legion.h>
 
@@ -27,6 +26,7 @@
 #include <stdexcept>
 
 #include "backend.h"
+#include "realm/upmem/upmem_api.h"
 #include "realm/upmem/upmem_internal.h"
 #include "realm/upmem/upmem_layout.h"
 #include "realm/upmem/upmem_module.h"
@@ -87,52 +87,78 @@ class LegionShard final : public DpuBackend::Shard {
  public:
   LegionShard(const Launch& launch, const std::vector<PhysicalRegion>& regions,
               const RankDPU& rank, uint32_t first_dpu)
-      : launch_(launch), rank_(rank), first_dpu_(first_dpu) {
+      : launch_(launch), first_dpu_(first_dpu) {
     for (size_t i = 0; i < regions.size(); i++) {
       const Operand& op = launch.operands[i];
       const Rect<1> rect = regions[i].get_bounds<1, coord_t>().bounds;
       FieldAccessor<LEGION_READ_WRITE, uint8_t, 1, coord_t,
                     Realm::AffineAccessor<uint8_t, 1, coord_t>>
           acc(regions[i], FID_DATA, op.element_size);
-      const uintptr_t ptr = (uintptr_t)acc.ptr(rect.lo);
-      starts_.push_back(ptr - REALM_UPMEM_RANK_PTR_BASE);
+      const void* ptr = acc.ptr(rect.lo);
+      Piece piece;
+      if (!Realm::Upmem::get_mram_block(rank.mram->me, ptr, &piece.block,
+                                        &piece.shard))
+        throw std::runtime_error(
+            "vector piece is not in a blocked rank memory");
+      piece.base = (uintptr_t)ptr - REALM_UPMEM_RANK_PTR_BASE - piece.block;
+      piece.local = piece.block / rank.nr_dpus;
+      piece.first = rect.lo[0];
       // Pieces are padded (see allocate); the kernel sees only real elements.
       const coord_t end =
           std::min<coord_t>(rect.hi[0] + 1, (coord_t)op.vec->num_elements);
-      bytes_.push_back(end > rect.lo[0] ? (end - rect.lo[0]) * op.element_size
-                                        : 0);
+      piece.bytes = end > rect.lo[0] ? (end - rect.lo[0]) * op.element_size : 0;
+      pieces_.push_back(piece);
     }
   }
 
   uint32_t dpu() const override { return first_dpu_ + dpu_; }
 
   uint32_t offset(const detail::VectorDesc& vec) const override {
-    const size_t i = find(vec);
-    return REALM_UPMEM_MRAM_DATA_OFFSET +
-           (uint32_t)realm_upmem_local_bound(starts_[i], dpu_, rank_.nr_dpus,
-                                             rank_.granule);
+    const Piece& p = pieces_[find(vec)];
+    // A DPU holding none of the piece still gets an address inside its shard.
+    const uint64_t in_shard =
+        lo(p) > dpu_start(p) ? std::min(lo(p) - dpu_start(p), p.shard) : 0;
+    return REALM_UPMEM_MRAM_DATA_OFFSET + (uint32_t)(p.local + in_shard);
   }
 
   uint32_t size_bytes(const detail::VectorDesc& vec) const override {
     const size_t i = find(vec);
     const Operand& op = launch_.operands[i];
     if (op.per_dpu) return (uint32_t)(op.payload_bytes + vec.reserved_bytes);
-    const uint64_t lo =
-        realm_upmem_local_bound(starts_[i], dpu_, rank_.nr_dpus, rank_.granule);
-    const uint64_t hi = realm_upmem_local_bound(starts_[i] + bytes_[i], dpu_,
-                                                rank_.nr_dpus, rank_.granule);
-    return (uint32_t)(hi - lo);
+    const Piece& p = pieces_[i];
+    return (uint32_t)(hi(p) - lo(p));
   }
 
-  uint32_t first_element(const detail::VectorDesc&) const override {
-    throw std::logic_error(
-        "the Legion backend interleaves shards, so kernels that need global "
-        "element indices are not supported yet");
+  uint32_t first_element(const detail::VectorDesc& vec) const override {
+    const size_t i = find(vec);
+    const Piece& p = pieces_[i];
+    return (uint32_t)(p.first +
+                      (lo(p) - p.base) / launch_.operands[i].element_size);
   }
 
   void at(uint32_t dpu) { dpu_ = dpu; }
 
  private:
+  // A vector's piece on this rank: bytes [base, base + bytes) of a blocked
+  // allocation whose DPU d holds bytes [d * shard, (d + 1) * shard).
+  struct Piece {
+    uint64_t block;  // rank address of the allocation
+    uint64_t shard;
+    uint64_t local;  // local offset of every DPU's shard
+    uint64_t base;
+    uint64_t bytes;
+    coord_t first;  // vector index of the piece's first element
+  };
+
+  uint64_t dpu_start(const Piece& p) const { return dpu_ * p.shard; }
+  // This DPU's part of the piece, as allocation bytes; empty when lo == hi.
+  uint64_t lo(const Piece& p) const {
+    return std::min(std::max(p.base, dpu_start(p)), p.base + p.bytes);
+  }
+  uint64_t hi(const Piece& p) const {
+    return std::max(lo(p), std::min(p.base + p.bytes, dpu_start(p) + p.shard));
+  }
+
   size_t find(const detail::VectorDesc& vec) const {
     for (size_t i = 0; i < launch_.operands.size(); i++)
       if (launch_.operands[i].vec == &vec) return i;
@@ -140,11 +166,9 @@ class LegionShard final : public DpuBackend::Shard {
   }
 
   const Launch& launch_;
-  const RankDPU& rank_;
   uint32_t first_dpu_;
   uint32_t dpu_ = 0;
-  std::vector<uint64_t> starts_;  // rank address of each region's piece
-  std::vector<uint64_t> bytes_;
+  std::vector<Piece> pieces_;
 };
 
 // Runs on a rank's processor: fills its DPUs' arguments and starts the
@@ -239,8 +263,11 @@ void register_tasks() {
   }
 }
 
-// Legion's command line: enough ranks for `num_dpus`, then anything in
-// $POLYMERPIM_LEGION_ARGS (later flags win).
+// Legion's command line: enough ranks for `num_dpus` in the blocked layout,
+// then anything in $POLYMERPIM_LEGION_ARGS (later flags win).
+//
+// The 8-byte granule balances shards to within a word: a blocked allocation
+// of R rows gives every DPU R granules.
 //
 // Reads and writes stage through system memory, and Legion keeps a vector's
 // host copy alive after the transfer, so system memory is sized to what the
@@ -250,8 +277,14 @@ std::vector<std::string> legion_args(uint32_t num_dpus) {
       std::max<uint32_t>(1, (num_dpus + REALM_UPMEM_MAX_DPUS_PER_RANK - 1) /
                                 REALM_UPMEM_MAX_DPUS_PER_RANK);
   const uint32_t sysmem_mb = std::min<uint32_t>(ranks * 4096, 65536);
-  std::vector<std::string> args = {"polymerpim", "-ll:num_ranks",
-                                   std::to_string(ranks), "-ll:csize",
+  std::vector<std::string> args = {"polymerpim",
+                                   "-ll:num_ranks",
+                                   std::to_string(ranks),
+                                   "-ll:dpu_layout",
+                                   "blocked",
+                                   "-ll:dpu_granule",
+                                   "8",
+                                   "-ll:csize",
                                    std::to_string(sysmem_mb)};
   if (const char* extra = std::getenv("POLYMERPIM_LEGION_ARGS")) {
     std::istringstream in(extra);
@@ -280,6 +313,9 @@ class LegionBackend final : public DpuBackend {
 
     const auto& ranks = upmem_module().dpus;
     if (ranks.empty()) throw std::runtime_error("Legion found no DPU ranks");
+    if (!Realm::Upmem::is_mram_blocked(ranks[0]->mram->me))
+      throw std::runtime_error(
+          "the Legion backend needs -ll:dpu_layout blocked");
     dpus_per_rank_ = ranks[0]->nr_dpus;
     granule_ = ranks[0]->granule;
     for (const RankDPU* rank : ranks)
@@ -407,20 +443,17 @@ class LegionBackend final : public DpuBackend {
       return;
     }
 
-    // Each rank's piece, as rank addresses from its row-aligned start; DPU d's
-    // slot is local bytes [0, payload) of it.
+    // Each rank's piece is whole rows, so DPU d's slot opens its shard of it.
     const size_t piece_bytes = s.region_elements / num_ranks_ * s.element_size;
+    const size_t shard =
+        realm_upmem_block_shard(piece_bytes, dpus_per_rank_, granule_);
     std::vector<char> pieces(piece_bytes * num_ranks_);
     read_region(s, pieces.data(), pieces.size());
-    const size_t payload = s.payload_bytes;
     for (uint32_t r = 0; r < num_ranks_; r++)
-      for (uint32_t d = 0; d < dpus_per_rank_; d++) {
-        char* out = host + (size_t)(r * dpus_per_rank_ + d) * stride;
-        for (size_t l = 0; l < payload; l++)
-          out[l] =
-              pieces[r * piece_bytes +
-                     realm_upmem_rank_addr(l, d, dpus_per_rank_, granule_)];
-      }
+      for (uint32_t d = 0; d < dpus_per_rank_; d++)
+        std::memcpy(host + (size_t)(r * dpus_per_rank_ + d) * stride,
+                    pieces.data() + r * piece_bytes + d * shard,
+                    s.payload_bytes);
   }
 
   void launch(const std::vector<detail::VectorDescRef>& vectors,
