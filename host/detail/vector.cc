@@ -44,6 +44,9 @@ void vec_xfer_from_dpu_strided(char* cpu, VectorDescRef desc, size_t stride) {
   DpuRuntime::get().backend().read(desc, cpu, stride);
 }
 
+// The argument callbacks below capture by value: a backend may run them after
+// launch() returns, once it knows where each shard landed.
+
 namespace {
 DpuBackend::InspectArgs log_launch_args() {
 #if ENABLE_DPU_LOGGING >= 1
@@ -58,7 +61,7 @@ DpuBackend::InspectArgs log_launch_args() {
 
 void internal_launch_binary_scalar(VectorDescRef res, VectorDescRef lhs,
                                    uint32_t scalar, KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args = {};
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_BINARY_SCALAR);
@@ -73,7 +76,7 @@ void internal_launch_binary_scalar(VectorDescRef res, VectorDescRef lhs,
 
 void internal_launch_fill(VectorDescRef res, uint32_t value,
                           KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args = {};
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_FILL);
@@ -88,7 +91,7 @@ void internal_launch_fill(VectorDescRef res, uint32_t value,
 
 void internal_launch_binary(VectorDescRef res, VectorDescRef lhs,
                             VectorDescRef rhs, KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_BINARY);
     args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
@@ -102,7 +105,7 @@ void internal_launch_binary(VectorDescRef res, VectorDescRef lhs,
 
 void internal_launch_unary(VectorDescRef res, VectorDescRef rhs,
                            KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_PIPELINE);
     args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
@@ -115,7 +118,7 @@ void internal_launch_unary(VectorDescRef res, VectorDescRef rhs,
 
 void internal_launch_reduction(VectorDescRef res, VectorDescRef rhs,
                                KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_REDUCTION);
     args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
@@ -149,7 +152,7 @@ void internal_launch_universal_pipeline(
   vectors.insert(vectors.end(), operands.begin(), operands.end());
   vectors.insert(vectors.end(), extra_outputs.begin(), extra_outputs.end());
 
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_UNARY);
 
@@ -209,11 +212,11 @@ void internal_launch_universal_pipeline(
 
   DpuBackend::InspectArgs inspect;
 #if ENABLE_DPU_LOGGING >= 1
-  inspect = [&](const DPU_LAUNCH_ARGS* args, uint32_t nr_of_dpus) {
+  inspect = [ops, hash = std::string(kernel_hash)](const DPU_LAUNCH_ARGS* args,
+                                                   uint32_t nr_of_dpus) {
     detail::FusionRpnSummary rpn_summary = detail::summarize_fusion_rpn(ops);
     log_dpu_launch_args(DpuRuntime::get().get_logger(), args, nr_of_dpus,
-                        rpn_summary.decoded_ops, rpn_summary.chains,
-                        kernel_hash);
+                        rpn_summary.decoded_ops, rpn_summary.chains, hash);
   };
 #else
   (void)kernel_hash;

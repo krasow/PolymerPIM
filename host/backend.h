@@ -64,6 +64,13 @@ class DpuBackend {
   // DpuOOMException when MRAM is exhausted.
   virtual detail::VectorDescRef allocate(size_t n, size_t reserved,
                                          size_t element_size, bool lazy) = 0;
+  // `n_per_dpu` elements on every DPU, each slot preceded by `reserved`
+  // bytes; read back in DPU order.  For per-DPU results such as reduction
+  // partials.
+  virtual detail::VectorDescRef allocate_per_dpu(size_t n_per_dpu,
+                                                 size_t reserved,
+                                                 size_t element_size,
+                                                 bool lazy) = 0;
   // A vector of `n` elements held in full by every DPU.
   virtual detail::VectorDescRef allocate_local(size_t n,
                                                size_t element_size) = 0;
@@ -74,12 +81,17 @@ class DpuBackend {
   // Copies `host`, the vector's elements in order, onto its shards.  `host`
   // must stay valid until the copy completes.
   virtual void write(const detail::VectorDescRef& vec, const char* host) = 0;
-  // Copies every shard into `host`, DPU i's at i * stride.
+  // How read() lays the vector out in host memory: one block per shard, at a
+  // uniform stride, in element order.  The vector must have storage.
+  virtual detail::ShardLayout read_layout(const detail::VectorDesc& vec) = 0;
+  // Copies every shard into `host`, shard i's at i * stride, where stride is
+  // read_layout(vec).stride.
   virtual void read(const detail::VectorDescRef& vec, char* host,
                     size_t stride) = 0;
 
   // Starts a kernel on every DPU.  `vectors` are the ones it touches (null
-  // entries are skipped); `fill` writes each DPU's arguments.
+  // entries are skipped); `fill` writes each DPU's arguments.  Both callbacks
+  // may run after launch() returns, so they must own what they capture.
   virtual void launch(const std::vector<detail::VectorDescRef>& vectors,
                       const FillArgs& fill, const InspectArgs& inspect) = 0;
 
