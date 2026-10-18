@@ -88,7 +88,11 @@ void DpuRuntime::init(uint32_t num_dpus) {
 
   // Allocate the DPUs and load the default binary
   std::string dpu_file = get_runtime_dpu_binary();
+#if POLYMERPIM_LEGION
+  backend_ = make_legion_backend();
+#else
   backend_ = make_native_backend();
+#endif
   num_dpus_ = backend_->open(num_dpus_, dpu_file);
 
 #if ENABLE_DPU_LOGGING >= 1

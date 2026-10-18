@@ -4,6 +4,8 @@ BUILDDIR ?= build
 NR_TASKLETS ?= 12
 
 BACKEND ?= hw
+# Device runtime under the queue: native (UPMEM SDK) or legion (upmem-legion).
+RUNTIME ?= native
 DEBUG ?= 0
 LOGGING ?= 3
 
@@ -89,6 +91,9 @@ HOST_INCLUDES := host
 HOST_SOURCES := $(wildcard ${HOST_DIR}/*.cc) $(wildcard ${HOST_DIR}/detail/*.cc) \
                 $(wildcard ${HOST_DIR}/perfetto/*.cc) \
                 $(wildcard ${HOST_DIR}/backends/native/*.cc)
+ifeq ($(RUNTIME),legion)
+HOST_SOURCES += $(wildcard ${HOST_DIR}/backends/legion/*.cc)
+endif
 DPU_SOURCES := $(wildcard ${DPU_DIR}/*.c)
 # One binary holds every suite; select subsets at run time with --filter.
 TEST_SOURCES := $(wildcard ${TEST_DIR}/*.cc)
@@ -137,6 +142,16 @@ __dirs := $(shell mkdir -p ${BUILDDIR} && mkdir -p ${BUILDDIR}/bin && mkdir -p $
 
 COMMON_FLAGS := -Wall -Wextra -I${COMMON_DIR} -I${HOST_DIR} $(EXTRA_FLAGS)
 HOST_FLAGS := ${COMMON_FLAGS} ${CXXFLAGS} `dpu-pkg-config --cflags --libs dpu`
+
+# upmem-legion lives in its own checkout; legion/ builds its shared libraries.
+LG_RT_DIR ?= $(CURDIR)/opt/upmem-legion/runtime
+LEGION_LIB_DIR := $(CURDIR)/legion
+LEGION_LIBS := $(LEGION_LIB_DIR)/liblegion.so $(LEGION_LIB_DIR)/librealm.so
+ifeq ($(RUNTIME),legion)
+HOST_FLAGS += -DPOLYMERPIM_LEGION=1 -I$(LEGION_LIB_DIR) -I$(LG_RT_DIR) \
+              -I$(LG_RT_DIR)/mappers
+LDFLAGS += -L$(LEGION_LIB_DIR) -Wl,-rpath,$(LEGION_LIB_DIR) -llegion -lrealm
+endif
 # DPU-specific flags
 DPU_FLAGS := ${COMMON_FLAGS} -Os -DNR_TASKLETS=${NR_TASKLETS}
 
@@ -165,6 +180,7 @@ make_header: common/config.h
 reconfigure:
 	@echo "NR_TASKLETS=$(NR_TASKLETS)" > $(CONFIG_STAMP)
 	@echo "BACKEND=$(BACKEND)" >> $(CONFIG_STAMP)
+	@echo "DEVICE_RUNTIME=$(RUNTIME)" >> $(CONFIG_STAMP)
 	@echo "DEBUG=$(DEBUG)" >> $(CONFIG_STAMP)
 	@echo "ENABLE_DPU_LOGGING=$(LOGGING)" >> $(CONFIG_STAMP)
 	@echo "ENABLE_AUTO_FENCING=$(ENABLE_AUTO_FENCING)" >> $(CONFIG_STAMP)
@@ -202,6 +218,9 @@ config_check: cache_old reconfigure make_header
 		rm -f $(CONFIG_STAMP).old; \
 	fi
 
+ifeq ($(RUNTIME),legion)
+${HOST_TARGET}: $(LEGION_LIBS)
+endif
 ${HOST_TARGET}: ${HOST_SOURCES} ${HOST_HEADERS} ${COMMON_HEADERS} $(GENERATED_TARGETS) | dependencies
 	$(CXX) -std=${CXX_STANDARD} -shared -fPIC -o $@ ${HOST_SOURCES} ${HOST_FLAGS} $(LDFLAGS)
 
@@ -212,6 +231,12 @@ $(TEST_TARGET): ${TEST_SOURCES} ${TEST_HEADERS} ${HOST_TARGET} ${DPU_TARGET}
 	@echo "Building test target: $@"
 	$(CXX) -std=${CXX_STANDARD} $(CXXFLAGS) $(COMMON_FLAGS) -pthread -o $@ $(TEST_SOURCES) -I$(HOST_INCLUDES)  \
 		-L$(BUILDDIR)/lib -Wl,-rpath,$(BUILDDIR)/lib -lpolymerpim
+
+# One sub-make builds both libraries.
+$(LEGION_LIB_DIR)/liblegion.so: scripts/install_legion.sh legion/Makefile
+	scripts/install_legion.sh
+	$(MAKE) -C legion LG_RT_DIR=$(LG_RT_DIR)
+$(LEGION_LIB_DIR)/librealm.so: $(LEGION_LIB_DIR)/liblegion.so
 
 clean-internal:
 	$(RM) -r $(BUILDDIR) $(TEST_TARGET)

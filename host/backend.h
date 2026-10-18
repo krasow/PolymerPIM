@@ -107,3 +107,6 @@ class DpuBackend {
 
 // The UPMEM SDK driving one dpu_set as a single stream.
 std::unique_ptr<DpuBackend> make_native_backend();
+// upmem-legion: vectors as regions, kernels as index launches over ranks.
+// Built only with RUNTIME=legion.
+std::unique_ptr<DpuBackend> make_legion_backend();
