@@ -1,6 +1,4 @@
-// DpuBackend over the UPMEM SDK.  One dpu_set spans every DPU, and the SDK's
-// asynchronous calls on it already run in issue order, so that set is the
-// stream.  Vectors live where `allocator` puts them.
+// DpuBackend over the UPMEM SDK: one dpu_set, whose async calls run in order.
 
 #include <cstring>
 #include <dpu>  // UPMEM rt syslib
@@ -27,8 +25,7 @@ dpu_error_t run_notification([[maybe_unused]] struct dpu_set_t stream,
   return DPU_OK;
 }
 
-// Reads placement straight from the allocator's per-DPU segments.  One object
-// walks every DPU of a launch in turn, so prefix sums are built once.
+// Placement from the allocator's segments; prefix sums built once per launch.
 class NativeShard final : public DpuBackend::Shard {
  public:
   uint32_t dpu() const override { return dpu_; }
@@ -93,8 +90,7 @@ class NativeBackend final : public DpuBackend {
     return allocator_->allocate_upmem_vector(n, reserved, element_size, lazy);
   }
 
-  // One shard per DPU is exactly what sharding num_dpus * n_per_dpu
-  // elements gives.
+  // Sharding num_dpus * n_per_dpu elements gives one slot per DPU.
   detail::VectorDescRef allocate_per_dpu(size_t n_per_dpu, size_t reserved,
                                          size_t element_size,
                                          bool lazy) override {
@@ -145,8 +141,7 @@ class NativeBackend final : public DpuBackend {
       for (const auto& vec : *list)
         if (vec) realize(vec);
 
-    // Left uninitialised like the stack arrays this replaced; `fill` writes
-    // what the kernel reads.
+    // Uninitialised; `fill` writes what the kernel reads.
     thread_local std::unique_ptr<DPU_LAUNCH_ARGS[]> buffer;
     thread_local uint32_t capacity = 0;
     if (capacity < num_dpus_) {

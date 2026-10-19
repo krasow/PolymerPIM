@@ -1,6 +1,5 @@
-// Placement policy: a vector spans one rank per $POLYMERPIM_RANK_BYTES of
-// data (1 MiB by default), and new placements rotate through the ranks so
-// independent vectors land on different ones and their kernels can overlap.
+// One rank per $POLYMERPIM_RANK_BYTES (1 MiB); placements rotate so
+// independent vectors use different ranks.
 
 #include "mapper.h"
 

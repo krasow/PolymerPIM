@@ -23,8 +23,7 @@ inline void release_handle(const VectorDescRef& desc) {
   if (desc && desc->handle_count > 0) desc->handle_count--;
 }
 
-// How a read of `desc` lands in host memory.  A backend may only settle that
-// once the vector's producer is issued, so issue it first when needed.
+// Read layout of `desc`, issuing its producer first if the backend needs it.
 inline ShardLayout read_layout(const VectorDescRef& desc) {
   auto& runtime = DpuRuntime::get();
   if (!runtime.backend().layout_ready(*desc))
@@ -319,7 +318,7 @@ typename dpu_vector<T>::reduction_result_t reduction_cpu(dpu_vector<T>& da,
       (da.data_desc_ref() ? da.data_desc_ref()->last_producer_id : 0);
   trace::reduction_cpu _trace(flow_id);
 
-  // One partial per DPU that ran the reduction, which may be fewer than all.
+  // One partial per DPU that ran it, possibly fewer than all.
   const size_t shards =
       DpuRuntime::get().backend().read_layout(da.data_desc()).logical.size();
   assert(shards > 0 && a.size() % shards == 0);
@@ -1176,7 +1175,7 @@ vector<T> dpu_local_vector<T>::to_cpu() {
       << "type=HOST_TRANSFER action=done id=" << e->id << std::endl;
 #endif
 
-  // One copy per DPU that holds the vector, which may be fewer than all.
+  // One copy per DPU holding it, possibly fewer than all.
   std::vector<T> merged(size_, detail::local_reduce_identity<T>(reduce_op_));
   for (size_t d = 0; d < layout.logical.size(); d++) {
     for (uint32_t i = 0; i < size_; i++) {

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Clones upmem-legion (Legion with the UPMEM Realm module) for RUNTIME=legion.
-# The build writes objects next to its sources, so it gets its own checkout
-# rather than sharing a working tree.
+# Clones upmem-legion at a pinned commit for RUNTIME=legion.
 
 set -euo pipefail
 
