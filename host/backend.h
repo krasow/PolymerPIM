@@ -55,8 +55,9 @@ class DpuBackend {
   virtual void close() = 0;
   virtual uint32_t num_dpus() const = 0;
 
-  // Replaces the program on every DPU.  The caller must ensure nothing is in
-  // flight.
+  // Launches from now on run `binary`.  A backend may load it on every DPU
+  // at once, so the caller must ensure nothing is in flight, or only on the
+  // DPUs each launch runs on.
   virtual void load(const std::string& binary) = 0;
 
   // A vector of `n` elements sharded across every DPU, each shard preceded by
