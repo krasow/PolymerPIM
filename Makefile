@@ -124,12 +124,47 @@ ifeq ($(JIT),1)
   LDFLAGS += -pthread
 endif
 
-.PHONY: dependencies config_check cache_old reconfigure all clean clean-internal test build-test list-tests install install-cpp install-julia uninstall print_config make_header
+.PHONY: dependencies config_check reconfigure all clean clean-internal test build-test list-tests install install-cpp install-julia uninstall print_config make_header
 
 GENERATED_TARGETS := dpu/kernels.h host/opinfo.h host/kernelids.h common/opcodes.h
 # Same generator, but not a C header -- must stay out of the install list.
 GENERATED_JULIA := julia/src/internal/opcodes.jl
 
+
+# Synced at parse time so -j builds can't race it; a change cleans the build.
+define CONFIG_CONTENT
+NR_TASKLETS=$(NR_TASKLETS)
+BACKEND=$(BACKEND)
+DEBUG=$(DEBUG)
+ENABLE_DPU_LOGGING=$(LOGGING)
+ENABLE_AUTO_FENCING=$(ENABLE_AUTO_FENCING)
+ENABLE_DPU_PRINTING=$(ENABLE_DPU_PRINTING)
+CXX_STANDARD=$(CXX_STANDARD)
+PIPELINE=$(PIPELINE)
+JIT=$(JIT)
+JIT_PIPELINE_FALLBACK=$(JIT_PIPELINE_FALLBACK)
+JIT_BATCH_SIZE=$(JIT_BATCH_SIZE)
+TRACE=$(TRACE)
+PERFETTO_HOME=$(PERFETTO_HOME)
+DEBUG_KEEP_JIT_DIR=$(DEBUG_KEEP_JIT_DIR)
+ENABLE_PROMOTION_REDUCTIONS=$(ENABLE_PROMOTION_REDUCTIONS)
+QUEUE_ABSORB_LIMIT=$(QUEUE_ABSORB_LIMIT)
+ENABLE_OOM_RECOVERY=1
+MAX_HFUSE_CHAINS=$(MAX_HFUSE_CHAINS)
+MAX_VFUSE_OPS=$(MAX_VFUSE_OPS)
+MAX_VFUSE_INPUTS=$(MAX_VFUSE_INPUTS)
+MAX_PIPELINE_STACK_DEPTH=$(MAX_PIPELINE_STACK_DEPTH)
+BLOCK_SIZE_LOG2=$(BLOCK_SIZE_LOG2)
+endef
+$(file >$(CONFIG_STAMP).new,$(CONFIG_CONTENT))
+CONFIG_STATUS := $(shell \
+  if [ ! -f $(CONFIG_STAMP) ]; then mv -f $(CONFIG_STAMP).new $(CONFIG_STAMP); echo new; \
+  elif cmp -s $(CONFIG_STAMP).new $(CONFIG_STAMP); then rm -f $(CONFIG_STAMP).new; echo same; \
+  else mv -f $(CONFIG_STAMP).new $(CONFIG_STAMP); echo changed; fi)
+ifeq ($(CONFIG_STATUS),changed)
+$(info Configuration changed, cleaning build...)
+__clean := $(shell $(RM) -r $(BUILDDIR) $(TEST_TARGET))
+endif
 
 __dirs := $(shell mkdir -p ${BUILDDIR} && mkdir -p ${BUILDDIR}/bin && mkdir -p ${BUILDDIR}/lib)
 
@@ -155,50 +190,10 @@ common/config.h: tools/generate_config.py $(CONFIG_STAMP)
 	@echo "Generating config header..."
 	python3 tools/generate_config.py
 
-$(CONFIG_STAMP):
-	@$(MAKE) reconfigure
-
 make_header: common/config.h
 
-reconfigure:
-	@echo "NR_TASKLETS=$(NR_TASKLETS)" > $(CONFIG_STAMP)
-	@echo "BACKEND=$(BACKEND)" >> $(CONFIG_STAMP)
-	@echo "DEBUG=$(DEBUG)" >> $(CONFIG_STAMP)
-	@echo "ENABLE_DPU_LOGGING=$(LOGGING)" >> $(CONFIG_STAMP)
-	@echo "ENABLE_AUTO_FENCING=$(ENABLE_AUTO_FENCING)" >> $(CONFIG_STAMP)
-	@echo "ENABLE_DPU_PRINTING=$(ENABLE_DPU_PRINTING)" >> $(CONFIG_STAMP)
-	@echo "CXX_STANDARD=$(CXX_STANDARD)" >> $(CONFIG_STAMP)
-	@echo "PIPELINE=$(PIPELINE)" >> $(CONFIG_STAMP)
-	@echo "JIT=$(JIT)" >> $(CONFIG_STAMP)
-	@echo "JIT_PIPELINE_FALLBACK=$(JIT_PIPELINE_FALLBACK)" >> $(CONFIG_STAMP)
-	@echo "JIT_BATCH_SIZE=$(JIT_BATCH_SIZE)" >> $(CONFIG_STAMP)
-	@echo "TRACE=$(TRACE)" >> $(CONFIG_STAMP)
-	@echo "PERFETTO_HOME=$(PERFETTO_HOME)" >> $(CONFIG_STAMP)
-	@echo "DEBUG_KEEP_JIT_DIR=$(DEBUG_KEEP_JIT_DIR)" >> $(CONFIG_STAMP)
-	@echo "ENABLE_PROMOTION_REDUCTIONS=$(ENABLE_PROMOTION_REDUCTIONS)" >> $(CONFIG_STAMP)
-	@echo "QUEUE_ABSORB_LIMIT=$(QUEUE_ABSORB_LIMIT)" >> $(CONFIG_STAMP)
-	@echo "ENABLE_OOM_RECOVERY=1" >> $(CONFIG_STAMP)
-	@echo "MAX_HFUSE_CHAINS=$(MAX_HFUSE_CHAINS)" >> $(CONFIG_STAMP)
-	@echo "MAX_VFUSE_OPS=$(MAX_VFUSE_OPS)" >> $(CONFIG_STAMP)
-	@echo "MAX_VFUSE_INPUTS=$(MAX_VFUSE_INPUTS)" >> $(CONFIG_STAMP)
-	@echo "MAX_PIPELINE_STACK_DEPTH=$(MAX_PIPELINE_STACK_DEPTH)" >> $(CONFIG_STAMP)
-	@echo "BLOCK_SIZE_LOG2=$(BLOCK_SIZE_LOG2)" >> $(CONFIG_STAMP)
-
-cache_old:
-	@if [ -f "$(CONFIG_STAMP)" ]; then \
-	    rm -f $(CONFIG_STAMP).old; \
-		cp -f $(CONFIG_STAMP) $(CONFIG_STAMP).old; \
-	fi
-
-config_check: cache_old reconfigure make_header
-	@if [ -f "$(CONFIG_STAMP)" ]; then \
-	    cmp -s $(CONFIG_STAMP) $(CONFIG_STAMP).old 2>/dev/null || { \
-	        echo "Configuration changed, cleaning build..."; \
-	        $(MAKE) clean-internal; \
-			mkdir -p $(BUILDDIR) && mkdir -p $(BUILDDIR)/bin && mkdir -p $(BUILDDIR)/lib; \
-	    }; \
-		rm -f $(CONFIG_STAMP).old; \
-	fi
+# Kept for callers; the configuration is synced when the Makefile is read.
+reconfigure config_check:
 
 ${HOST_TARGET}: ${HOST_SOURCES} ${HOST_HEADERS} ${COMMON_HEADERS} $(GENERATED_TARGETS) | dependencies
 	$(CXX) -std=${CXX_STANDARD} -shared -fPIC -o $@ ${HOST_SOURCES} ${HOST_FLAGS} $(LDFLAGS)
