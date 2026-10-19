@@ -149,11 +149,10 @@ void internal_launch_universal_pipeline(
                              "); rebuild with JIT=1 or raise MAX_VFUSE_OPS");
 #endif
 
-  // Extra outputs may be local vectors the kernel accumulates into, so they
-  // are read as well as written.
+  // Extra outputs -- horizontally fused results and local vectors, whose
+  // accumulators start from the identity -- are written in full.
   std::vector<VectorDescRef> reads = {init};
   reads.insert(reads.end(), operands.begin(), operands.end());
-  reads.insert(reads.end(), extra_outputs.begin(), extra_outputs.end());
   std::vector<VectorDescRef> writes = {res};
   writes.insert(writes.end(), extra_outputs.begin(), extra_outputs.end());
 

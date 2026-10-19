@@ -23,7 +23,7 @@ UPMEM SDK directly. Vectors become Legion regions partitioned over DPU ranks,
 and the Legion mapper decides where they live.
 
 ```bash
-make test RUNTIME=legion PIPELINE=0 JIT=0
+make test RUNTIME=legion PIPELINE=1 JIT=1
 ```
 
 The first build clones upmem-legion into `opt/upmem-legion` and builds its
@@ -34,9 +34,8 @@ Legion flags through `POLYMERPIM_LEGION_ARGS`, for example
 
 Rank memory uses upmem-legion's blocked layout (`-ll:dpu_layout blocked`), so
 each DPU holds one contiguous shard of every vector, as with the native
-runtime. Only eager mode works so far: element-wise operations, scalar
-operations, fills and reductions. Local vectors, fusion and JIT are not
-supported yet.
+runtime. Eager mode, fusion and JIT all work. A binary switch waits for every
+rank to drain, since one binary is loaded on all ranks at a time.
 
 ## C++ API
 
