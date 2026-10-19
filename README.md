@@ -34,8 +34,14 @@ Legion flags through `POLYMERPIM_LEGION_ARGS`, for example
 
 Rank memory uses upmem-legion's blocked layout (`-ll:dpu_layout blocked`), so
 each DPU holds one contiguous shard of every vector, as with the native
-runtime. Eager mode, fusion and JIT all work. A binary switch waits for every
-rank to drain, since one binary is loaded on all ranks at a time.
+runtime. Eager mode, fusion and JIT all work, and each rank loads a JIT binary
+only when a launch on it needs one.
+
+Known limitation: nothing moves data between DPUs of one rank, since Legion
+treats a rank as a single memory. Every kernel operand must give a DPU the same
+elements; a mismatch aborts instead of computing wrong results. Intra-rank
+copies are a TODO (see `check_aligned` in
+`host/backends/legion/legion_backend.cc`).
 
 ## C++ API
 
