@@ -6,7 +6,8 @@
 // launch with one point per rank, whose task fills that rank's per-DPU
 // arguments and starts the binary asynchronously on the rank's stream -- the
 // task completes once the rank drains.  Legion orders dependent launches, so
-// operations report completion as soon as they are issued.
+// operations report completion as soon as they are issued.  A launch carries
+// its binary, which its tasks load on their own ranks when needed.
 //
 // Rank memory uses Realm's blocked layout: each instance is split into one
 // contiguous shard per DPU, all at the same local offset, so a DPU holds a
@@ -46,10 +47,6 @@ enum : TaskID {
   READ_TASK_ID,
   TOP_LEVEL_TASK_ID,
 };
-// A raw Realm task; Legion numbers its variants up from
-// TASK_ID_FIRST_AVAILABLE, so this sits well past them.
-constexpr Realm::Processor::TaskFuncID LOAD_TASK_ID =
-    Realm::Processor::TASK_ID_FIRST_AVAILABLE + (1u << 20);
 constexpr FieldID FID_DATA = 1;
 
 UpmemModule& upmem_module() {
@@ -102,7 +99,29 @@ struct Launch {
   DpuBackend::FillArgs fill;
   DpuBackend::InspectArgs inspect;
   std::vector<Operand> operands;  // in region requirement order
+  std::string binary;
 };
+
+// The binary each rank has loaded.  A rank only changes it from its own
+// kernel task, holding its transfer mutex.
+std::mutex resident_mutex;
+std::map<const RankDPU*, std::string> resident;
+
+// Loads `binary` on `rank` unless it is already there.  Called with the
+// rank's transfer mutex held.
+void ensure_binary(RankDPU& rank, dpu_set_t* stream,
+                   const std::string& binary) {
+  {
+    std::lock_guard<std::mutex> lock(resident_mutex);
+    auto it = resident.find(&rank);
+    if (it != resident.end() && it->second == binary) return;
+  }
+  // The rank's earlier kernels must finish on the binary they were built for.
+  CHECK_UPMEM(dpu_sync(*stream));
+  CHECK_UPMEM(dpu_load(*stream, binary.c_str(), nullptr));
+  std::lock_guard<std::mutex> lock(resident_mutex);
+  resident[&rank] = binary;
+}
 
 // One rank's view of a launch: placement comes from the instances Legion
 // mapped for this point task.
@@ -212,6 +231,7 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
 
   // The UPMEM runtime isn't safe for concurrent calls on one rank.
   Realm::AutoLock<> al(rank->get_xfer_mutex());
+  ensure_binary(*rank, stream, launch.binary);
   for (uint32_t d = 0; d < nr; d++)
     CHECK_UPMEM(dpu_prepare_xfer(rank->dpu_handles[d], &args[d]));
   CHECK_UPMEM(dpu_push_xfer(*stream, DPU_XFER_TO_DPU, "args", 0,
@@ -246,18 +266,6 @@ void read_task(const Task* task, const std::vector<PhysicalRegion>& regions,
                 Realm::AffineAccessor<uint8_t, 1, coord_t>>
       acc(regions[0], FID_DATA, copy.element_size);
   std::memcpy(copy.host, acc.ptr(rect.lo), copy.bytes);
-}
-
-// Realm task on one rank's processor: replaces its program.
-void load_task(const void* args, size_t, const void*, size_t,
-               Realm::Processor) {
-  UpmemModule& mod = upmem_module();
-  RankDPU* rank = mod.get_task_dpu();
-  dpu_set_t* stream = mod.get_task_upmem_stream();
-  assert(rank && stream);
-  Realm::AutoLock<> al(rank->get_xfer_mutex());
-  CHECK_UPMEM(dpu_sync(*stream));
-  CHECK_UPMEM(dpu_load(*stream, static_cast<const char*>(args), nullptr));
 }
 
 void register_tasks() {
@@ -349,10 +357,6 @@ class LegionBackend final : public DpuBackend {
     colors_ =
         runtime_->create_index_space(ctx_, Rect<1>(0, (coord_t)num_ranks_ - 1));
 
-    Realm::Processor::register_task_by_kind(
-        Realm::Processor::DPU_PROC, false /*!global*/, LOAD_TASK_ID,
-        Realm::CodeDescriptor(load_task), Realm::ProfilingRequestSet())
-        .wait();
     load(binary);
     open_ = true;
     return num_dpus_;
@@ -369,18 +373,9 @@ class LegionBackend final : public DpuBackend {
 
   uint32_t num_dpus() const override { return num_dpus_; }
 
-  void load(const std::string& binary) override {
-    // The queue sees every kernel as done once issued, but some may still be
-    // waiting on a rank; they must run on the binary they were built for.
-    if (open_) sync();
-    Machine::ProcessorQuery query(Machine::get_machine());
-    query.only_kind(Processor::DPU_PROC);
-    std::vector<Realm::Event> loaded;
-    for (Processor proc : query)
-      loaded.push_back(
-          proc.spawn(LOAD_TASK_ID, binary.c_str(), binary.size() + 1));
-    Realm::Event::merge_events(loaded).wait();
-  }
+  // Each kernel task loads its launch's binary on its own rank when that
+  // rank holds a different one, so a switch touches only the ranks it runs on.
+  void load(const std::string& binary) override { binary_ = binary; }
 
   detail::VectorDescRef allocate(size_t n, size_t reserved, size_t element_size,
                                  bool) override {
@@ -484,7 +479,7 @@ class LegionBackend final : public DpuBackend {
               const std::vector<detail::VectorDescRef>& writes,
               const FillArgs& fill, const InspectArgs& inspect) override {
     reap(false);
-    auto pending = std::make_unique<Launch>(Launch{fill, inspect, {}});
+    auto pending = std::make_unique<Launch>(Launch{fill, inspect, {}, binary_});
     std::vector<const Storage*> regions;
     auto add = [&](const detail::VectorDescRef& vec, PrivilegeMode privilege) {
       if (!vec) return;
@@ -594,6 +589,7 @@ class LegionBackend final : public DpuBackend {
   Runtime* runtime_ = nullptr;
   Context ctx_ = nullptr;
   std::vector<std::string> argv_storage_;
+  std::string binary_;  // what launches run (see load)
   std::vector<char*> argv_;
   IndexSpace colors_;
   uint32_t num_ranks_ = 0, dpus_per_rank_ = 0, num_dpus_ = 0, granule_ = 0;
