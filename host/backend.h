@@ -85,6 +85,9 @@ class DpuBackend {
   // How read() lays the vector out in host memory: one block per shard, at a
   // uniform stride, in element order.  The vector must have storage.
   virtual detail::ShardLayout read_layout(const detail::VectorDesc& vec) = 0;
+  // False until read_layout(vec) is known, which some backends settle only
+  // once the vector's producer has been launched.
+  virtual bool layout_ready(const detail::VectorDesc&) { return true; }
   // Copies every shard into `host`, shard i's at i * stride, where stride is
   // read_layout(vec).stride.
   virtual void read(const detail::VectorDescRef& vec, char* host,
