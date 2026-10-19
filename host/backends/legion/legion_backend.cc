@@ -370,6 +370,9 @@ class LegionBackend final : public DpuBackend {
   uint32_t num_dpus() const override { return num_dpus_; }
 
   void load(const std::string& binary) override {
+    // The queue sees every kernel as done once issued, but some may still be
+    // waiting on a rank; they must run on the binary they were built for.
+    if (open_) sync();
     Machine::ProcessorQuery query(Machine::get_machine());
     query.only_kind(Processor::DPU_PROC);
     std::vector<Realm::Event> loaded;
@@ -406,9 +409,11 @@ class LegionBackend final : public DpuBackend {
     return vec;
   }
 
-  detail::VectorDescRef allocate_local(size_t, size_t) override {
-    throw std::logic_error(
-        "local vectors are not supported by the Legion backend yet");
+  // A per-DPU vector whose length is the local one, as kernels read it.
+  detail::VectorDescRef allocate_local(size_t n, size_t element_size) override {
+    auto vec = allocate_per_dpu(n, 0, element_size, false);
+    vec->num_elements = n;
+    return vec;
   }
 
   void realize(const detail::VectorDescRef&) override {}

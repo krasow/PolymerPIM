@@ -1115,8 +1115,8 @@ dpu_local_vector<T>::dpu_local_vector(uint32_t n, dpu_local_reduce_op reduce_op,
 template <typename T>
 vector<T> dpu_local_vector<T>::to_cpu() {
   auto& runtime = DpuRuntime::get();
-  uint32_t nr_dpus = runtime.num_dpus();
 #if ENABLE_DPU_LOGGING >= 2
+  const uint32_t nr_dpus = runtime.num_dpus();
   Logger& logger = runtime.get_logger();
   logger.lock(logcat::TRANSFER, 2)
       << "type=COMPUTE action=wait_dependency last_producer_id="
@@ -1165,8 +1165,9 @@ vector<T> dpu_local_vector<T>::to_cpu() {
       << "type=HOST_TRANSFER action=done id=" << e->id << std::endl;
 #endif
 
+  // One copy per DPU that holds the vector, which may be fewer than all.
   std::vector<T> merged(size_, detail::local_reduce_identity<T>(reduce_op_));
-  for (uint32_t d = 0; d < nr_dpus; d++) {
+  for (size_t d = 0; d < layout.logical.size(); d++) {
     for (uint32_t i = 0; i < size_; i++) {
       T value;
       std::memcpy(&value,
