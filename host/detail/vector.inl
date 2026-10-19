@@ -22,6 +22,15 @@ inline void retain_handle(const VectorDescRef& desc) {
 inline void release_handle(const VectorDescRef& desc) {
   if (desc && desc->handle_count > 0) desc->handle_count--;
 }
+
+// How a read of `desc` lands in host memory.  A backend may only settle that
+// once the vector's producer is issued, so issue it first when needed.
+inline ShardLayout read_layout(const VectorDescRef& desc) {
+  auto& runtime = DpuRuntime::get();
+  if (!runtime.backend().layout_ready(*desc))
+    runtime.get_event_queue().process_events(desc->last_producer_id);
+  return runtime.backend().read_layout(*desc);
+}
 }  // namespace detail
 
 template <typename T>
@@ -206,7 +215,7 @@ vector<T> dpu_vector<T>::to_cpu() {
   auto desc = this->data_desc_ref();
   DpuRuntime::get().backend().realize(desc);
   const size_t result_elems =
-      DpuRuntime::get().backend().read_layout(*desc).total_logical / sizeof(T);
+      detail::read_layout(desc).total_logical / sizeof(T);
 
   vector<T> cpu_vec(result_elems);
   to_cpu_into(cpu_vec.data(), result_elems);
@@ -222,8 +231,7 @@ size_t dpu_vector<T>::to_cpu_into(T* out, size_t capacity) {
   // One transfer size applies to every DPU, so ragged shards have to land in a
   // padded staging buffer and be compacted afterwards.  When every shard's
   // payload already fills the stride we read straight into the result.
-  const detail::ShardLayout layout =
-      DpuRuntime::get().backend().read_layout(*desc);
+  const detail::ShardLayout layout = detail::read_layout(desc);
   const size_t result_elems = layout.total_logical / sizeof(T);
   const size_t n = std::min(result_elems, capacity);
 
@@ -311,9 +319,11 @@ typename dpu_vector<T>::reduction_result_t reduction_cpu(dpu_vector<T>& da,
       (da.data_desc_ref() ? da.data_desc_ref()->last_producer_id : 0);
   trace::reduction_cpu _trace(flow_id);
 
-  auto& runtime = DpuRuntime::get();
-  assert(a.size() % runtime.num_dpus() == 0);
-  size_t stride = a.size() / runtime.num_dpus();
+  // One partial per DPU that ran the reduction, which may be fewer than all.
+  const size_t shards =
+      DpuRuntime::get().backend().read_layout(da.data_desc()).logical.size();
+  assert(shards > 0 && a.size() % shards == 0);
+  size_t stride = a.size() / shards;
   // initialize accumulator with the first partial result
   typename dpu_vector<T>::reduction_result_t acc = a[0];
 
@@ -745,9 +755,10 @@ template <typename T>
 arg_reduction_result<T> lazy_arg_reduction_result<T>::get() {
   if (ready) return cached;
   auto partials = vec.to_cpu();
-  auto& runtime = DpuRuntime::get();
-  if (partials.empty() || runtime.num_dpus() == 0) return {T{}, 0};
-  size_t stride = partials.size() / runtime.num_dpus();
+  if (partials.empty()) return {T{}, 0};
+  size_t stride =
+      partials.size() /
+      DpuRuntime::get().backend().read_layout(vec.data_desc()).logical.size();
   assert(stride >= 2);
   arg_reduction_result<T> best = {partials[0],
                                   static_cast<uint32_t>(partials[1])};

@@ -1,9 +1,10 @@
 // DpuBackend over Legion, using upmem-legion's Realm module: one processor and
 // one MRAM memory per rank.
 //
-// A vector is a 1-D logical region equally partitioned over the ranks; the
-// mapper decides where each piece's instance lives.  A kernel is an index
-// launch with one point per rank, whose task fills that rank's per-DPU
+// A vector is a 1-D logical region.  The first kernel to use it places it on
+// a run of ranks chosen by the mapper (see mapper.h), and vectors a kernel
+// touches together share one placement.  A kernel is an index launch with one
+// point per rank of that placement, whose task fills the rank's per-DPU
 // arguments and starts the binary asynchronously on the rank's stream -- the
 // task completes once the rank drains.  Legion orders dependent launches, so
 // operations report completion as soon as they are issued.  A launch carries
@@ -29,6 +30,7 @@
 
 #include "backend.h"
 #include "default_mapper.h"
+#include "mapper.h"
 #include "realm/upmem/upmem_api.h"
 #include "realm/upmem/upmem_internal.h"
 #include "realm/upmem/upmem_layout.h"
@@ -39,16 +41,9 @@
 namespace {
 
 using namespace Legion;
+using namespace polymerpim_legion;
 using Realm::Upmem::UpmemModule;
 using RankDPU = Realm::Upmem::DPU;
-
-// Below LEGION_MAX_APPLICATION_TASK_ID.
-enum : TaskID {
-  KERNEL_TASK_ID = 0x504d1,
-  WRITE_TASK_ID,
-  READ_TASK_ID,
-  TOP_LEVEL_TASK_ID,
-};
 constexpr FieldID FID_DATA = 1;
 
 UpmemModule& upmem_module() {
@@ -135,15 +130,19 @@ class LegionShard final : public DpuBackend::Shard {
     for (size_t i = 0; i < regions.size(); i++) {
       const Operand& op = launch.operands[i];
       const Rect<1> rect = regions[i].get_bounds<1, coord_t>().bounds;
+      Piece piece{};
+      piece.first = rect.lo[0];
+      if (rect.empty()) {
+        pieces_.push_back(piece);
+        continue;
+      }
       const void* ptr = piece_ptr(regions[i], rect, op);
-      Piece piece;
       if (!Realm::Upmem::get_mram_block(rank.mram->me, ptr, &piece.block,
                                         &piece.shard))
         throw std::runtime_error(
             "vector piece is not in a blocked rank memory");
       piece.base = (uintptr_t)ptr - REALM_UPMEM_RANK_PTR_BASE - piece.block;
       piece.local = piece.block / rank.nr_dpus;
-      piece.first = rect.lo[0];
       // Pieces are padded (see allocate); the kernel sees only real elements.
       const coord_t end =
           std::min<coord_t>(rect.hi[0] + 1, (coord_t)op.vec->num_elements);
@@ -307,6 +306,7 @@ void read_task(const Task* task, const std::vector<PhysicalRegion>& regions,
 }
 
 void register_tasks() {
+  register_mapper();
   {
     TaskVariantRegistrar registrar(KERNEL_TASK_ID, "polymerpim_kernel");
     registrar.add_constraint(ProcessorConstraint(Processor::DPU_PROC));
@@ -392,9 +392,6 @@ class LegionBackend final : public DpuBackend {
     num_ranks_ = (uint32_t)ranks.size();
     num_dpus_ = num_ranks_ * dpus_per_rank_;
 
-    colors_ =
-        runtime_->create_index_space(ctx_, Rect<1>(0, (coord_t)num_ranks_ - 1));
-
     load(binary);
     open_ = true;
     return num_dpus_;
@@ -403,7 +400,8 @@ class LegionBackend final : public DpuBackend {
   void close() override {
     if (!open_) return;
     sync();
-    runtime_->destroy_index_space(ctx_, colors_);
+    for (const auto& [count, space] : colors_)
+      runtime_->destroy_index_space(ctx_, space);
     runtime_->finish_implicit_task(ctx_);
     Runtime::wait_for_shutdown();
     open_ = false;
@@ -420,24 +418,29 @@ class LegionBackend final : public DpuBackend {
     if (reserved != 0)
       throw std::logic_error(
           "the Legion backend has no reserved bytes for sharded vectors");
-    // Every rank's piece is a whole number of 8-byte words.  Pieces start on
-    // a row boundary, so copies then never split a word -- Realm handles a
-    // partial word with a synchronous read-modify-write that drains the rank.
-    const size_t unit = num_ranks_ * (8 / element_size);
-    const size_t padded = (std::max<size_t>(n, 1) + unit - 1) / unit * unit;
-    return make_vector(padded, element_size, n, false, 0);
+    // Padded to whole 8-byte words; pieces split on word boundaries and start
+    // on a row, so copies never split a word -- Realm handles a partial word
+    // with a synchronous read-modify-write that drains the rank.
+    const size_t unit = 8 / element_size;
+    Storage s;
+    s.element_size = element_size;
+    s.region_elements = (std::max<size_t>(n, 1) + unit - 1) / unit * unit;
+    s.region = make_region(s.region_elements, element_size);
+    return add_vector(n, std::move(s));
   }
 
-  // Every DPU needs its own slot at the same local offset, so each rank's
-  // piece spans whole rows: `rows` granules on every DPU.
+  // Every DPU needs its own slot, so each rank's piece is whole rows: `rows`
+  // granules on every DPU.  How many ranks is only known once it is placed.
   detail::VectorDescRef allocate_per_dpu(size_t n_per_dpu, size_t reserved,
                                          size_t element_size, bool) override {
     const size_t slot = (n_per_dpu * element_size + reserved + 7) & ~size_t{7};
     const size_t rows = (slot + granule_ - 1) / granule_;
-    const size_t piece_bytes = rows * granule_ * dpus_per_rank_;
-    auto vec =
-        make_vector(piece_bytes / element_size * num_ranks_, element_size,
-                    n_per_dpu * num_dpus_, true, n_per_dpu * element_size);
+    Storage s;
+    s.element_size = element_size;
+    s.per_dpu = true;
+    s.payload_bytes = n_per_dpu * element_size;
+    s.piece_bytes = rows * granule_ * dpus_per_rank_;
+    auto vec = add_vector(n_per_dpu * num_dpus_, std::move(s));
     vec->reserved_bytes = reserved;
     return vec;
   }
@@ -456,9 +459,11 @@ class LegionBackend final : public DpuBackend {
     auto it = storage_.find(&vec);
     if (it == storage_.end()) return;
     const Storage& s = it->second;
-    runtime_->destroy_logical_region(ctx_, s.region);
-    runtime_->destroy_field_space(ctx_, s.region.get_field_space());
-    runtime_->destroy_index_space(ctx_, s.region.get_index_space());
+    if (s.region.exists()) {
+      runtime_->destroy_logical_region(ctx_, s.region);
+      runtime_->destroy_field_space(ctx_, s.region.get_field_space());
+      runtime_->destroy_index_space(ctx_, s.region.get_index_space());
+    }
     storage_.erase(it);
     vec.ptr_allocated = false;
   }
@@ -477,11 +482,21 @@ class LegionBackend final : public DpuBackend {
     runtime_->execute_task(ctx_, launcher).get_void_result();
   }
 
+  // A per-DPU vector spans the ranks of the kernel that writes it.
+  bool layout_ready(const detail::VectorDesc& vec) override {
+    const Storage& s = storage_of(vec);
+    return !s.per_dpu || s.placed;
+  }
+
   detail::ShardLayout read_layout(const detail::VectorDesc& vec) override {
     const Storage& s = storage_of(vec);
     detail::ShardLayout layout;
     if (s.per_dpu) {
-      layout.logical.assign(num_dpus_, s.payload_bytes);
+      if (!s.placed)
+        throw std::logic_error(
+            "per-DPU vector read before any kernel wrote it");
+      layout.logical.assign(s.placement.ranks * dpus_per_rank_,
+                            s.payload_bytes);
       layout.stride = s.payload_bytes;
     } else {
       const size_t bytes = vec.num_elements * s.element_size;
@@ -501,15 +516,15 @@ class LegionBackend final : public DpuBackend {
     }
 
     // Each rank's piece is whole rows, so DPU d's slot opens its shard of it.
-    const size_t piece_bytes = s.region_elements / num_ranks_ * s.element_size;
+    const uint32_t ranks = s.placement.ranks;
     const size_t shard =
-        realm_upmem_block_shard(piece_bytes, dpus_per_rank_, granule_);
-    std::vector<char> pieces(piece_bytes * num_ranks_);
+        realm_upmem_block_shard(s.piece_bytes, dpus_per_rank_, granule_);
+    std::vector<char> pieces(s.piece_bytes * ranks);
     read_region(s, pieces.data(), pieces.size());
-    for (uint32_t r = 0; r < num_ranks_; r++)
+    for (uint32_t r = 0; r < ranks; r++)
       for (uint32_t d = 0; d < dpus_per_rank_; d++)
         std::memcpy(host + (size_t)(r * dpus_per_rank_ + d) * stride,
-                    pieces.data() + r * piece_bytes + d * shard,
+                    pieces.data() + r * s.piece_bytes + d * shard,
                     s.payload_bytes);
   }
 
@@ -518,7 +533,7 @@ class LegionBackend final : public DpuBackend {
               const FillArgs& fill, const InspectArgs& inspect) override {
     reap(false);
     auto pending = std::make_unique<Launch>(Launch{fill, inspect, {}, binary_});
-    std::vector<const Storage*> regions;
+    std::vector<Storage*> regions;
     auto add = [&](const detail::VectorDescRef& vec, PrivilegeMode privilege) {
       if (!vec) return;
       for (Operand& op : pending->operands)
@@ -526,7 +541,7 @@ class LegionBackend final : public DpuBackend {
           if (op.privilege != privilege) op.privilege = LEGION_READ_WRITE;
           return;
         }
-      const Storage& s = storage_of(*vec);
+      Storage& s = storage_of(*vec);
       pending->operands.push_back(
           {vec.get(), privilege, s.element_size, s.per_dpu, s.payload_bytes});
       regions.push_back(&s);
@@ -535,15 +550,18 @@ class LegionBackend final : public DpuBackend {
     for (const auto& vec : reads) add(vec, LEGION_READ_ONLY);
     for (const auto& vec : writes) add(vec, LEGION_WRITE_DISCARD);
 
+    const Placement placement = place(pending->operands, regions);
+
     Launch* raw = pending.get();
-    IndexLauncher launcher(KERNEL_TASK_ID, colors_,
+    IndexLauncher launcher(KERNEL_TASK_ID, colors(placement.ranks),
                            TaskArgument(&raw, sizeof(raw)), ArgumentMap());
+    launcher.tag = (MappingTagID)placement.first << PLACEMENT_TAG_SHIFT;
     for (size_t i = 0; i < regions.size(); i++) {
       // Exact instances: a shard's elements depend on its instance's bounds
       // (see check_aligned), so a larger instance must not be reused.
       launcher.add_region_requirement(RegionRequirement(
-          regions[i]->partition, 0, pending->operands[i].privilege,
-          LEGION_EXCLUSIVE, regions[i]->region,
+          partition(*regions[i], placement.ranks), 0,
+          pending->operands[i].privilege, LEGION_EXCLUSIVE, regions[i]->region,
           Mapping::DefaultMapper::EXACT_REGION));
       launcher.add_field((unsigned)i, FID_DATA);
     }
@@ -566,38 +584,108 @@ class LegionBackend final : public DpuBackend {
 
  private:
   struct Storage {
-    LogicalRegion region;
-    LogicalPartition partition;
-    size_t element_size;
-    size_t region_elements;
-    bool per_dpu;
-    size_t payload_bytes;  // per-DPU vectors: what each DPU's slot holds
+    // Per-DPU vectors: created when placed, since the rank count sizes it.
+    LogicalRegion region = LogicalRegion::NO_REGION;
+    size_t element_size = 0;
+    size_t region_elements = 0;
+    bool per_dpu = false;
+    size_t payload_bytes = 0;  // per-DPU vectors: what each DPU's slot holds
+    size_t piece_bytes = 0;    // per-DPU vectors: one rank's piece
+    bool placed = false;
+    Placement placement{};
+    // The vector split over that many ranks.
+    std::map<uint32_t, LogicalPartition> partitions;
   };
 
-  detail::VectorDescRef make_vector(size_t region_elements, size_t element_size,
-                                    size_t n, bool per_dpu,
-                                    size_t payload_bytes) {
+  LogicalRegion make_region(size_t elements, size_t element_size) {
     IndexSpace is = runtime_->create_index_space(
-        ctx_, Rect<1>(0, (coord_t)std::max<size_t>(region_elements, 1) - 1));
+        ctx_, Rect<1>(0, (coord_t)std::max<size_t>(elements, 1) - 1));
     FieldSpace fs = runtime_->create_field_space(ctx_);
     {
       FieldAllocator alloc = runtime_->create_field_allocator(ctx_, fs);
       alloc.allocate_field(element_size, FID_DATA);
     }
-    LogicalRegion region = runtime_->create_logical_region(ctx_, is, fs);
-    IndexPartition ip = runtime_->create_equal_partition(ctx_, is, colors_);
+    return runtime_->create_logical_region(ctx_, is, fs);
+  }
 
+  detail::VectorDescRef add_vector(size_t n, Storage s) {
     auto vec = std::make_shared<detail::VectorDesc>();
     vec->num_elements = n;
-    vec->element_size = (uint32_t)element_size;
-    vec->allocated_footprint_bytes = region_elements * element_size;
+    vec->element_size = (uint32_t)s.element_size;
+    vec->allocated_footprint_bytes = s.region_elements * s.element_size;
     vec->ptr_allocated = true;
     std::lock_guard<std::mutex> lock(mtx_);
-    storage_[vec.get()] = {
-        region,       runtime_->get_logical_partition(ctx_, region, ip),
-        element_size, region_elements,
-        per_dpu,      payload_bytes};
+    storage_[vec.get()] = std::move(s);
     return vec;
+  }
+
+  IndexSpace colors(uint32_t ranks) {
+    auto it = colors_.find(ranks);
+    if (it == colors_.end())
+      it = colors_
+               .emplace(ranks, runtime_->create_index_space(
+                                   ctx_, Rect<1>(0, (coord_t)ranks - 1)))
+               .first;
+    return it->second;
+  }
+
+  // The launch runs where its first placed operand lives; vectors not placed
+  // yet join it, and if none is placed the mapper picks a new run of ranks.
+  Placement place(const std::vector<Operand>& operands,
+                  const std::vector<Storage*>& regions) {
+    const Storage* anchor = nullptr;
+    uint64_t bytes = 0;
+    for (size_t i = 0; i < regions.size(); i++) {
+      if (regions[i]->placed && !anchor) anchor = regions[i];
+      if (!regions[i]->per_dpu)
+        bytes = std::max<uint64_t>(
+            bytes, operands[i].vec->num_elements * regions[i]->element_size);
+    }
+
+    Placement placement;
+    if (anchor) {
+      placement = anchor->placement;
+    } else {
+      TunableLauncher tunable(PLACEMENT_TUNABLE, 0, 0, sizeof(Placement));
+      tunable.arg = UntypedBuffer(&bytes, sizeof(bytes));
+      placement =
+          runtime_->select_tunable_value(ctx_, tunable).get_result<Placement>();
+    }
+
+    for (Storage* s : regions) {
+      if (s->placed) continue;
+      s->placed = true;
+      s->placement = placement;
+      if (s->per_dpu) {
+        s->region_elements = s->piece_bytes / s->element_size * placement.ranks;
+        s->region = make_region(s->region_elements, s->element_size);
+      }
+    }
+    return placement;
+  }
+
+  // Pieces split on 8-byte words (see allocate); per-DPU vectors split on
+  // their whole-row pieces.
+  LogicalPartition partition(Storage& s, uint32_t ranks) {
+    auto it = s.partitions.find(ranks);
+    if (it != s.partitions.end()) return it->second;
+
+    const size_t unit = s.per_dpu ? s.piece_bytes / s.element_size
+                                  : std::max<size_t>(8 / s.element_size, 1);
+    const size_t chunk =
+        (s.region_elements + ranks * unit - 1) / (ranks * unit) * unit;
+    std::map<DomainPoint, Domain> pieces;
+    for (uint32_t r = 0; r < ranks; r++) {
+      const coord_t lo = (coord_t)std::min(r * chunk, s.region_elements);
+      const coord_t hi =
+          (coord_t)std::min((r + 1) * chunk, s.region_elements) - 1;
+      pieces[DomainPoint(Point<1>(r))] = Domain(Rect<1>(lo, hi));
+    }
+    IndexPartition ip = runtime_->create_partition_by_domain(
+        ctx_, s.region.get_index_space(), pieces, colors(ranks));
+    LogicalPartition lp = runtime_->get_logical_partition(ctx_, s.region, ip);
+    s.partitions.emplace(ranks, lp);
+    return lp;
   }
 
   Storage& storage_of(const detail::VectorDesc& vec) {
@@ -632,7 +720,7 @@ class LegionBackend final : public DpuBackend {
   std::vector<std::string> argv_storage_;
   std::string binary_;  // what launches run (see load)
   std::vector<char*> argv_;
-  IndexSpace colors_;
+  std::map<uint32_t, IndexSpace> colors_;  // [0, ranks) per rank count
   uint32_t num_ranks_ = 0, dpus_per_rank_ = 0, num_dpus_ = 0, granule_ = 0;
   bool open_ = false;
 
