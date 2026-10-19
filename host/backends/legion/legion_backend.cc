@@ -1,19 +1,6 @@
-// DpuBackend over Legion, using upmem-legion's Realm module: one processor and
-// one MRAM memory per rank.
-//
-// A vector is a 1-D logical region.  The first kernel to use it places it on
-// a run of ranks chosen by the mapper (see mapper.h), and vectors a kernel
-// touches together share one placement.  A kernel is an index launch with one
-// point per rank of that placement, whose task fills the rank's per-DPU
-// arguments and starts the binary asynchronously on the rank's stream -- the
-// task completes once the rank drains.  Legion orders dependent launches, so
-// operations report completion as soon as they are issued.  A launch carries
-// its binary, which its tasks load on their own ranks when needed.
-//
-// Rank memory uses Realm's blocked layout: each instance is split into one
-// contiguous shard per DPU, all at the same local offset, so a DPU holds a
-// contiguous range of each vector piece -- the same shape the native allocator
-// gives.
+// DpuBackend over upmem-legion (one processor and blocked MRAM memory per
+// rank).  Vectors are regions placed by the mapper on first use; a kernel is
+// an index launch with one point per rank of its placement.
 
 #include <legion.h>
 
@@ -52,7 +39,7 @@ UpmemModule& upmem_module() {
   return *mod;
 }
 
-// Index of `rank` in the module's rank list; ranks are numbered in that order.
+// Index of `rank` in the module's rank list.
 uint32_t rank_index(const RankDPU* rank) {
   const auto& ranks = upmem_module().dpus;
   auto it = std::find(ranks.begin(), ranks.end(), rank);
@@ -60,7 +47,7 @@ uint32_t rank_index(const RankDPU* rank) {
   return (uint32_t)(it - ranks.begin());
 }
 
-// How a launch's region requirement relates to the vector it names.
+// A launch's region requirement and the vector it names.
 struct Operand {
   const detail::VectorDesc* vec;
   PrivilegeMode privilege;
@@ -70,7 +57,7 @@ struct Operand {
   size_t payload_bytes;
 };
 
-// Where a piece's first element is; the accessor must match the privilege.
+// A piece's first element; the accessor must match the privilege.
 template <PrivilegeMode PRIV>
 const void* piece_ptr(const PhysicalRegion& region, const Rect<1>& rect,
                       size_t element_size) {
@@ -99,13 +86,11 @@ struct Launch {
   std::string binary;
 };
 
-// The binary each rank has loaded.  A rank only changes it from its own
-// kernel task, holding its transfer mutex.
+// Binary loaded on each rank; changed only by that rank's kernel task.
 std::mutex resident_mutex;
 std::map<const RankDPU*, std::string> resident;
 
-// Loads `binary` on `rank` unless it is already there.  Called with the
-// rank's transfer mutex held.
+// Loads `binary` on `rank` if needed; call with the rank's xfer mutex held.
 void ensure_binary(RankDPU& rank, dpu_set_t* stream,
                    const std::string& binary) {
   {
@@ -113,15 +98,14 @@ void ensure_binary(RankDPU& rank, dpu_set_t* stream,
     auto it = resident.find(&rank);
     if (it != resident.end() && it->second == binary) return;
   }
-  // The rank's earlier kernels must finish on the binary they were built for.
+  // Earlier kernels must finish on their own binary.
   CHECK_UPMEM(dpu_sync(*stream));
   CHECK_UPMEM(dpu_load(*stream, binary.c_str(), nullptr));
   std::lock_guard<std::mutex> lock(resident_mutex);
   resident[&rank] = binary;
 }
 
-// One rank's view of a launch: placement comes from the instances Legion
-// mapped for this point task.
+// One rank's view of a launch, from the instances mapped for its task.
 class LegionShard final : public DpuBackend::Shard {
  public:
   LegionShard(const Launch& launch, const std::vector<PhysicalRegion>& regions,
@@ -143,7 +127,7 @@ class LegionShard final : public DpuBackend::Shard {
             "vector piece is not in a blocked rank memory");
       piece.base = (uintptr_t)ptr - REALM_UPMEM_RANK_PTR_BASE - piece.block;
       piece.local = piece.block / rank.nr_dpus;
-      // Pieces are padded (see allocate); the kernel sees only real elements.
+      // Pieces are padded; the kernel sees only real elements.
       const coord_t end =
           std::min<coord_t>(rect.hi[0] + 1, (coord_t)op.vec->num_elements);
       piece.bytes = end > rect.lo[0] ? (end - rect.lo[0]) * op.element_size : 0;
@@ -155,7 +139,7 @@ class LegionShard final : public DpuBackend::Shard {
 
   uint32_t offset(const detail::VectorDesc& vec) const override {
     const Piece& p = pieces_[find(vec)];
-    // A DPU holding none of the piece still gets an address inside its shard.
+    // Empty DPUs still get an address inside their shard.
     const uint64_t in_shard =
         lo(p) > dpu_start(p) ? std::min(lo(p) - dpu_start(p), p.shard) : 0;
     return REALM_UPMEM_MRAM_DATA_OFFSET + (uint32_t)(p.local + in_shard);
@@ -179,8 +163,8 @@ class LegionShard final : public DpuBackend::Shard {
   void at(uint32_t dpu) { dpu_ = dpu; }
 
  private:
-  // A vector's piece on this rank: bytes [base, base + bytes) of a blocked
-  // allocation whose DPU d holds bytes [d * shard, (d + 1) * shard).
+  // Bytes [base, base + bytes) of a blocked allocation; DPU d holds
+  // [d * shard, (d + 1) * shard).
   struct Piece {
     uint64_t block;  // rank address of the allocation
     uint64_t shard;
@@ -191,7 +175,7 @@ class LegionShard final : public DpuBackend::Shard {
   };
 
   uint64_t dpu_start(const Piece& p) const { return dpu_ * p.shard; }
-  // This DPU's part of the piece, as allocation bytes; empty when lo == hi.
+  // This DPU's part of the piece; empty when lo == hi.
   uint64_t lo(const Piece& p) const {
     return std::min(std::max(p.base, dpu_start(p)), p.base + p.bytes);
   }
@@ -211,17 +195,12 @@ class LegionShard final : public DpuBackend::Shard {
   std::vector<Piece> pieces_;
 };
 
-// A DPU reads only its own MRAM, and nothing moves data between DPUs of a
-// rank, so every sharded operand must give each DPU the same elements.
-// Mismatched shards would compute on unrelated elements, so stop instead.
+// Every sharded operand must give each DPU the same elements: nothing moves
+// data between DPUs of a rank.
 //
-// TODO: intra-rank copies.  Legion sees one memory per rank, so it never moves
-// data between DPUs of a rank, and upmem-legion registers no MRAM-to-MRAM
-// channel (XFER_DPU_IN_MRAM is never instantiated).  A host-bounce channel
-// batched across the rank would let Legion realign shards instead of this
-// abort, and is the base for ops that exchange data between DPUs (shifts,
-// gather/scatter, scans, broadcasts): either as per-DPU Legion memories or as
-// explicit exchange ops here.
+// TODO: intra-rank copies.  Legion sees one memory per rank and upmem-legion
+// has no MRAM-to-MRAM channel.  A host-bounce channel would let Legion realign
+// shards here, and enable ops that exchange data (shifts, gather, scans).
 void check_aligned(const Launch& launch, const LegionShard& shard) {
   const Operand* ref = nullptr;
   for (const Operand& op : launch.operands) {
@@ -246,8 +225,8 @@ void check_aligned(const Launch& launch, const LegionShard& shard) {
   }
 }
 
-// Runs on a rank's processor: fills its DPUs' arguments and starts the
-// kernel.  The task completes when the rank's stream drains.
+// Fills a rank's DPU arguments and starts the kernel; done when the rank
+// drains.
 int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
                 Context, Runtime*) {
   const Launch& launch = **static_cast<Launch* const*>(task->args);
@@ -277,8 +256,7 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   return 0;
 }
 
-// Copies `bytes` from the start of a whole region; regions may be padded
-// past the vector's end.
+// Copies `bytes` from the start of a (possibly padded) region.
 struct HostCopy {
   void* host;
   size_t bytes;
@@ -329,15 +307,8 @@ void register_tasks() {
   }
 }
 
-// Legion's command line: enough ranks for `num_dpus` in the blocked layout,
-// then anything in $POLYMERPIM_LEGION_ARGS (later flags win).
-//
-// The 8-byte granule balances shards to within a word: a blocked allocation
-// of R rows gives every DPU R granules.
-//
-// Reads and writes stage through system memory, and Legion keeps a vector's
-// host copy alive after the transfer, so system memory is sized to what the
-// ranks can hold rather than Realm's 512 MB default.
+// Legion flags, then $POLYMERPIM_LEGION_ARGS (later wins).  An 8-byte granule
+// balances shards to a word; sysmem holds the host copies Legion keeps.
 std::vector<std::string> legion_args(uint32_t num_dpus) {
   const uint32_t ranks =
       std::max<uint32_t>(1, (num_dpus + REALM_UPMEM_MAX_DPUS_PER_RANK - 1) /
@@ -409,8 +380,7 @@ class LegionBackend final : public DpuBackend {
 
   uint32_t num_dpus() const override { return num_dpus_; }
 
-  // Each kernel task loads its launch's binary on its own rank when that
-  // rank holds a different one, so a switch touches only the ranks it runs on.
+  // Kernel tasks load it on their own ranks (see ensure_binary).
   void load(const std::string& binary) override { binary_ = binary; }
 
   detail::VectorDescRef allocate(size_t n, size_t reserved, size_t element_size,
@@ -418,9 +388,8 @@ class LegionBackend final : public DpuBackend {
     if (reserved != 0)
       throw std::logic_error(
           "the Legion backend has no reserved bytes for sharded vectors");
-    // Padded to whole 8-byte words; pieces split on word boundaries and start
-    // on a row, so copies never split a word -- Realm handles a partial word
-    // with a synchronous read-modify-write that drains the rank.
+    // Padded to whole words so copies never take Realm's slow partial-word
+    // path.
     const size_t unit = 8 / element_size;
     Storage s;
     s.element_size = element_size;
@@ -429,8 +398,7 @@ class LegionBackend final : public DpuBackend {
     return add_vector(n, std::move(s));
   }
 
-  // Every DPU needs its own slot, so each rank's piece is whole rows: `rows`
-  // granules on every DPU.  How many ranks is only known once it is placed.
+  // Each rank's piece is whole rows, one slot per DPU; sized once placed.
   detail::VectorDescRef allocate_per_dpu(size_t n_per_dpu, size_t reserved,
                                          size_t element_size, bool) override {
     const size_t slot = (n_per_dpu * element_size + reserved + 7) & ~size_t{7};
@@ -445,7 +413,7 @@ class LegionBackend final : public DpuBackend {
     return vec;
   }
 
-  // A per-DPU vector whose length is the local one, as kernels read it.
+  // A per-DPU vector whose length is the local one.
   detail::VectorDescRef allocate_local(size_t n, size_t element_size) override {
     auto vec = allocate_per_dpu(n, 0, element_size, false);
     vec->num_elements = n;
@@ -472,7 +440,7 @@ class LegionBackend final : public DpuBackend {
     const Storage& s = storage_of(*vec);
     if (s.per_dpu)
       throw std::logic_error("per-DPU vectors are written only by kernels");
-    // Waited on so the caller's buffer can go as soon as the event retires.
+    // Waited on so the caller may free `host` once the event retires.
     HostCopy copy{const_cast<char*>(host), vec->num_elements * s.element_size,
                   s.element_size};
     TaskLauncher launcher(WRITE_TASK_ID, TaskArgument(&copy, sizeof(copy)));
@@ -515,7 +483,7 @@ class LegionBackend final : public DpuBackend {
       return;
     }
 
-    // Each rank's piece is whole rows, so DPU d's slot opens its shard of it.
+    // DPU d's slot opens its shard of the rank's piece.
     const uint32_t ranks = s.placement.ranks;
     const size_t shard =
         realm_upmem_block_shard(s.piece_bytes, dpus_per_rank_, granule_);
@@ -557,8 +525,7 @@ class LegionBackend final : public DpuBackend {
                            TaskArgument(&raw, sizeof(raw)), ArgumentMap());
     launcher.tag = (MappingTagID)placement.first << PLACEMENT_TAG_SHIFT;
     for (size_t i = 0; i < regions.size(); i++) {
-      // Exact instances: a shard's elements depend on its instance's bounds
-      // (see check_aligned), so a larger instance must not be reused.
+      // Exact instances: shards depend on instance bounds (check_aligned).
       launcher.add_region_requirement(RegionRequirement(
           partition(*regions[i], placement.ranks), 0,
           pending->operands[i].privilege, LEGION_EXCLUSIVE, regions[i]->region,
@@ -570,7 +537,7 @@ class LegionBackend final : public DpuBackend {
     inflight_.push_back({done, std::move(pending)});
   }
 
-  // Legion already orders dependent work, so nothing is gained by waiting.
+  // Legion orders dependent work, so there is nothing to wait for.
   void notify(std::function<void()> done) override { done(); }
 
   void sync() override {
@@ -584,7 +551,7 @@ class LegionBackend final : public DpuBackend {
 
  private:
   struct Storage {
-    // Per-DPU vectors: created when placed, since the rank count sizes it.
+    // Per-DPU vectors: created when placed.
     LogicalRegion region = LogicalRegion::NO_REGION;
     size_t element_size = 0;
     size_t region_elements = 0;
@@ -593,7 +560,7 @@ class LegionBackend final : public DpuBackend {
     size_t piece_bytes = 0;    // per-DPU vectors: one rank's piece
     bool placed = false;
     Placement placement{};
-    // The vector split over that many ranks.
+    // Partitions by rank count.
     std::map<uint32_t, LogicalPartition> partitions;
   };
 
@@ -629,8 +596,8 @@ class LegionBackend final : public DpuBackend {
     return it->second;
   }
 
-  // The launch runs where its first placed operand lives; vectors not placed
-  // yet join it, and if none is placed the mapper picks a new run of ranks.
+  // Runs where the first placed operand lives (others join it), else asks
+  // the mapper.
   Placement place(const std::vector<Operand>& operands,
                   const std::vector<Storage*>& regions) {
     const Storage* anchor = nullptr;
@@ -664,8 +631,7 @@ class LegionBackend final : public DpuBackend {
     return placement;
   }
 
-  // Pieces split on 8-byte words (see allocate); per-DPU vectors split on
-  // their whole-row pieces.
+  // Pieces split on words; per-DPU vectors on their whole-row pieces.
   LogicalPartition partition(Storage& s, uint32_t ranks) {
     auto it = s.partitions.find(ranks);
     if (it != s.partitions.end()) return it->second;
@@ -705,8 +671,8 @@ class LegionBackend final : public DpuBackend {
     runtime_->execute_task(ctx_, launcher).get_void_result();
   }
 
-  // Frees finished launches here, on the thread that owns the context: their
-  // callbacks hold vectors whose release calls back into Legion.
+  // Frees finished launches on the context's thread: their callbacks hold
+  // vectors whose release calls into Legion.
   void reap(bool all) {
     while (!inflight_.empty()) {
       if (!all && !inflight_.front().first.is_ready()) break;

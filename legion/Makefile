@@ -1,6 +1,4 @@
-# Builds liblegion.so and librealm.so with the UPMEM module, for RUNTIME=legion.
-# Run from the top-level Makefile, which passes LG_RT_DIR; objects land in the
-# upmem-legion checkout and the libraries and *_defines.h in this directory.
+# Builds liblegion.so and librealm.so (UPMEM module) here for RUNTIME=legion.
 
 ifndef LG_RT_DIR
 $(error LG_RT_DIR variable is not defined, aborting build)

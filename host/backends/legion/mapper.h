@@ -1,6 +1,5 @@
 #pragma once
-// PolymerPIM's Legion mapper: decides how many ranks a vector spans and
-// which, and runs each kernel launch on its vectors' ranks.
+// Legion mapper: picks the ranks each vector spans and runs launches there.
 
 #include <legion.h>
 
@@ -20,13 +19,11 @@ struct Placement {
   uint32_t ranks;
 };
 
-// Asks the mapper where to put vectors not yet placed.  The argument is the
-// bytes of the largest one (uint64_t); the result is a Placement.
+// Tunable: bytes of the largest unplaced operand (uint64_t) -> Placement.
 constexpr Legion::TunableID PLACEMENT_TUNABLE = 0x504d;
 
-// A kernel launch over Placement::ranks points runs point i on rank
-// first + i, with first carried in its mapping tag above the bits the default
-// mapper reads.
+// Launch point i runs on rank first + i; first rides in the tag, above the
+// default mapper's bits.
 constexpr unsigned PLACEMENT_TAG_SHIFT = 8;
 
 // Installs the mapper on every processor; call before Runtime::start.

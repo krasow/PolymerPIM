@@ -353,8 +353,7 @@ void log_oom_requeued(const std::shared_ptr<Event>& e) {
 // The EventQueue members below are the mechanics those helpers serve.
 using namespace detail;
 
-// Marks `me` finished once the backend reports that everything issued before
-// it has completed.
+// Marks `me` finished once everything issued before it completes.
 static void finish_when_drained(std::shared_ptr<Event> me) {
   auto& queue = DpuRuntime::get().get_event_queue();
   queue.outstanding_callbacks_++;
