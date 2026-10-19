@@ -215,6 +215,14 @@ class LegionShard final : public DpuBackend::Shard {
 // A DPU reads only its own MRAM, and nothing moves data between DPUs of a
 // rank, so every sharded operand must give each DPU the same elements.
 // Mismatched shards would compute on unrelated elements, so stop instead.
+//
+// TODO: intra-rank copies.  Legion sees one memory per rank, so it never moves
+// data between DPUs of a rank, and upmem-legion registers no MRAM-to-MRAM
+// channel (XFER_DPU_IN_MRAM is never instantiated).  A host-bounce channel
+// batched across the rank would let Legion realign shards instead of this
+// abort, and is the base for ops that exchange data between DPUs (shifts,
+// gather/scatter, scans, broadcasts): either as per-DPU Legion memories or as
+// explicit exchange ops here.
 void check_aligned(const Launch& launch, const LegionShard& shard) {
   const Operand* ref = nullptr;
   for (const Operand& op : launch.operands) {
