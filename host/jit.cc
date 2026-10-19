@@ -475,6 +475,11 @@ void jit_cleanup() {
     } catch (...) {
     }
   }
+  // The caches name files just removed; a runtime started again in this
+  // process must compile afresh rather than link objects that are gone.
+  g_jit_cache.clear();
+  g_kernel_obj_cache.clear();
+  g_kernel_obj_inflight.clear();
 }
 
 #endif  // JIT
