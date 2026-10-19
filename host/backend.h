@@ -89,10 +89,12 @@ class DpuBackend {
   virtual void read(const detail::VectorDescRef& vec, char* host,
                     size_t stride) = 0;
 
-  // Starts a kernel on every DPU.  `vectors` are the ones it touches (null
-  // entries are skipped); `fill` writes each DPU's arguments.  Both callbacks
-  // may run after launch() returns, so they must own what they capture.
-  virtual void launch(const std::vector<detail::VectorDescRef>& vectors,
+  // Starts a kernel on every DPU.  It reads `reads` and overwrites `writes`
+  // in full; a vector in both is updated in place (null entries are skipped).
+  // `fill` writes each DPU's arguments.  Both callbacks may run after launch()
+  // returns, so they must own what they capture.
+  virtual void launch(const std::vector<detail::VectorDescRef>& reads,
+                      const std::vector<detail::VectorDescRef>& writes,
                       const FillArgs& fill, const InspectArgs& inspect) = 0;
 
   // Runs `done` once everything issued before it has completed.  `done` may

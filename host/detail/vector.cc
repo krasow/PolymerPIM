@@ -71,7 +71,7 @@ void internal_launch_binary_scalar(VectorDescRef res, VectorDescRef lhs,
     args.binary_scalar.rhs_scalar = scalar;
     args.binary_scalar.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, lhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({lhs}, {res}, fill, log_launch_args());
 }
 
 void internal_launch_fill(VectorDescRef res, uint32_t value,
@@ -86,7 +86,7 @@ void internal_launch_fill(VectorDescRef res, uint32_t value,
     args.binary_scalar.rhs_scalar = value;
     args.binary_scalar.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({}, {res}, fill, log_launch_args());
 }
 
 void internal_launch_binary(VectorDescRef res, VectorDescRef lhs,
@@ -100,7 +100,8 @@ void internal_launch_binary(VectorDescRef res, VectorDescRef lhs,
     args.binary.rhs_offset = s.offset(*rhs);
     args.binary.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, lhs, rhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({lhs, rhs}, {res}, fill,
+                                     log_launch_args());
 }
 
 void internal_launch_unary(VectorDescRef res, VectorDescRef rhs,
@@ -113,7 +114,7 @@ void internal_launch_unary(VectorDescRef res, VectorDescRef rhs,
     args.unary.rhs_offset = s.offset(*rhs);
     args.unary.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, rhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({rhs}, {res}, fill, log_launch_args());
 }
 
 void internal_launch_reduction(VectorDescRef res, VectorDescRef rhs,
@@ -126,7 +127,7 @@ void internal_launch_reduction(VectorDescRef res, VectorDescRef rhs,
     args.reduction.rhs_offset = s.offset(*rhs);
     args.reduction.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, rhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({rhs}, {res}, fill, log_launch_args());
 }
 
 #if PIPELINE
@@ -148,9 +149,13 @@ void internal_launch_universal_pipeline(
                              "); rebuild with JIT=1 or raise MAX_VFUSE_OPS");
 #endif
 
-  std::vector<VectorDescRef> vectors = {res, init};
-  vectors.insert(vectors.end(), operands.begin(), operands.end());
-  vectors.insert(vectors.end(), extra_outputs.begin(), extra_outputs.end());
+  // Extra outputs may be local vectors the kernel accumulates into, so they
+  // are read as well as written.
+  std::vector<VectorDescRef> reads = {init};
+  reads.insert(reads.end(), operands.begin(), operands.end());
+  reads.insert(reads.end(), extra_outputs.begin(), extra_outputs.end());
+  std::vector<VectorDescRef> writes = {res};
+  writes.insert(writes.end(), extra_outputs.begin(), extra_outputs.end());
 
   auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
@@ -222,7 +227,7 @@ void internal_launch_universal_pipeline(
   (void)kernel_hash;
 #endif
 
-  DpuRuntime::get().backend().launch(vectors, fill, inspect);
+  DpuRuntime::get().backend().launch(reads, writes, fill, inspect);
 }
 #endif
 

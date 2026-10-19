@@ -138,10 +138,12 @@ class NativeBackend final : public DpuBackend {
     push(DPU_XFER_FROM_DPU, host_ptrs, vec->desc[0].ptr, stride);
   }
 
-  void launch(const std::vector<detail::VectorDescRef>& vectors,
+  void launch(const std::vector<detail::VectorDescRef>& reads,
+              const std::vector<detail::VectorDescRef>& writes,
               const FillArgs& fill, const InspectArgs& inspect) override {
-    for (const auto& vec : vectors)
-      if (vec) realize(vec);
+    for (const auto* list : {&reads, &writes})
+      for (const auto& vec : *list)
+        if (vec) realize(vec);
 
     // Left uninitialised like the stack arrays this replaced; `fill` writes
     // what the kernel reads.

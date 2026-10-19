@@ -69,11 +69,34 @@ uint32_t rank_index(const RankDPU* rank) {
 // How a launch's region requirement relates to the vector it names.
 struct Operand {
   const detail::VectorDesc* vec;
+  PrivilegeMode privilege;
   size_t element_size;
   // Per-DPU vectors only: the elements each DPU holds.
   bool per_dpu;
   size_t payload_bytes;
 };
+
+// Where a piece's first element is; the accessor must match the privilege.
+template <PrivilegeMode PRIV>
+const void* piece_ptr(const PhysicalRegion& region, const Rect<1>& rect,
+                      size_t element_size) {
+  FieldAccessor<PRIV, uint8_t, 1, coord_t,
+                Realm::AffineAccessor<uint8_t, 1, coord_t>>
+      acc(region, FID_DATA, element_size);
+  return acc.ptr(rect.lo);
+}
+
+const void* piece_ptr(const PhysicalRegion& region, const Rect<1>& rect,
+                      const Operand& op) {
+  switch (op.privilege) {
+    case LEGION_READ_ONLY:
+      return piece_ptr<LEGION_READ_ONLY>(region, rect, op.element_size);
+    case LEGION_WRITE_DISCARD:
+      return piece_ptr<LEGION_WRITE_DISCARD>(region, rect, op.element_size);
+    default:
+      return piece_ptr<LEGION_READ_WRITE>(region, rect, op.element_size);
+  }
+}
 
 struct Launch {
   DpuBackend::FillArgs fill;
@@ -91,10 +114,7 @@ class LegionShard final : public DpuBackend::Shard {
     for (size_t i = 0; i < regions.size(); i++) {
       const Operand& op = launch.operands[i];
       const Rect<1> rect = regions[i].get_bounds<1, coord_t>().bounds;
-      FieldAccessor<LEGION_READ_WRITE, uint8_t, 1, coord_t,
-                    Realm::AffineAccessor<uint8_t, 1, coord_t>>
-          acc(regions[i], FID_DATA, op.element_size);
-      const void* ptr = acc.ptr(rect.lo);
+      const void* ptr = piece_ptr(regions[i], rect, op);
       Piece piece;
       if (!Realm::Upmem::get_mram_block(rank.mram->me, ptr, &piece.block,
                                         &piece.shard))
@@ -406,7 +426,7 @@ class LegionBackend final : public DpuBackend {
   }
 
   void write(const detail::VectorDescRef& vec, const char* host) override {
-    Storage& s = storage_of(*vec);
+    const Storage& s = storage_of(*vec);
     if (s.per_dpu)
       throw std::logic_error("per-DPU vectors are written only by kernels");
     // Waited on so the caller's buffer can go as soon as the event retires.
@@ -417,7 +437,6 @@ class LegionBackend final : public DpuBackend {
         s.region, LEGION_WRITE_DISCARD, LEGION_EXCLUSIVE, s.region));
     launcher.add_field(0, FID_DATA);
     runtime_->execute_task(ctx_, launcher).get_void_result();
-    s.written = true;
   }
 
   detail::ShardLayout read_layout(const detail::VectorDesc& vec) override {
@@ -456,37 +475,36 @@ class LegionBackend final : public DpuBackend {
                     s.payload_bytes);
   }
 
-  void launch(const std::vector<detail::VectorDescRef>& vectors,
+  void launch(const std::vector<detail::VectorDescRef>& reads,
+              const std::vector<detail::VectorDescRef>& writes,
               const FillArgs& fill, const InspectArgs& inspect) override {
     reap(false);
     auto pending = std::make_unique<Launch>(Launch{fill, inspect, {}});
-    std::vector<Storage*> regions;
-    for (const auto& vec : vectors) {
-      if (!vec) continue;
-      const bool seen =
-          std::any_of(pending->operands.begin(), pending->operands.end(),
-                      [&](const Operand& op) { return op.vec == vec.get(); });
-      if (seen) continue;
-      Storage& s = storage_of(*vec);
+    std::vector<const Storage*> regions;
+    auto add = [&](const detail::VectorDescRef& vec, PrivilegeMode privilege) {
+      if (!vec) return;
+      for (Operand& op : pending->operands)
+        if (op.vec == vec.get()) {
+          if (op.privilege != privilege) op.privilege = LEGION_READ_WRITE;
+          return;
+        }
+      const Storage& s = storage_of(*vec);
       pending->operands.push_back(
-          {vec.get(), s.element_size, s.per_dpu, s.payload_bytes});
+          {vec.get(), privilege, s.element_size, s.per_dpu, s.payload_bytes});
       regions.push_back(&s);
-    }
+    };
+    // A written vector is overwritten in full unless it is also read.
+    for (const auto& vec : reads) add(vec, LEGION_READ_ONLY);
+    for (const auto& vec : writes) add(vec, LEGION_WRITE_DISCARD);
 
     Launch* raw = pending.get();
     IndexLauncher launcher(KERNEL_TASK_ID, colors_,
                            TaskArgument(&raw, sizeof(raw)), ArgumentMap());
-    // The launch API does not say which operands a kernel only reads, so
-    // every one is read-write and Legion orders the launch after all earlier
-    // users.  A vector's first user is always the kernel producing it in full,
-    // so until then its contents can be discarded.
     for (size_t i = 0; i < regions.size(); i++) {
       launcher.add_region_requirement(RegionRequirement(
-          regions[i]->partition, 0,
-          regions[i]->written ? LEGION_READ_WRITE : LEGION_WRITE_DISCARD,
+          regions[i]->partition, 0, pending->operands[i].privilege,
           LEGION_EXCLUSIVE, regions[i]->region));
       launcher.add_field((unsigned)i, FID_DATA);
-      regions[i]->written = true;
     }
     Future done =
         runtime_->execute_index_space(ctx_, launcher, LEGION_REDOP_SUM_INT32);
@@ -513,7 +531,6 @@ class LegionBackend final : public DpuBackend {
     size_t region_elements;
     bool per_dpu;
     size_t payload_bytes;  // per-DPU vectors: what each DPU's slot holds
-    bool written = false;
   };
 
   detail::VectorDescRef make_vector(size_t region_elements, size_t element_size,
