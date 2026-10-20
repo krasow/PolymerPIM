@@ -25,7 +25,12 @@ end
     @test ndpus() > 0
     @test ntasklets() > 0
     @test N % ndpus() == 0
-    @test ndpus() == parse(Int, get(ENV, "NR_DPUS", "8"))
+    requested = parse(Int, get(ENV, "NR_DPUS", "8"))
+    if get(configuration(), "DEVICE_RUNTIME", "native") == "legion"
+        @test ndpus() >= requested  # Legion allocates whole ranks
+    else
+        @test ndpus() == requested
+    end
     @test ntasklets() == parse(Int, configuration()["NR_TASKLETS"])
 
     out = sprint(PolymerPIM.versioninfo)
