@@ -84,6 +84,8 @@ struct Launch {
   DpuBackend::InspectArgs inspect;
   std::vector<Operand> operands;  // in region requirement order
   std::string binary;
+  // Per point; kept until the launch is reaped since the push is async.
+  std::vector<std::vector<DPU_LAUNCH_ARGS>> args;
 };
 
 // Binary loaded on each rank; changed only by that rank's kernel task.
@@ -229,7 +231,7 @@ void check_aligned(const Launch& launch, const LegionShard& shard) {
 // drains.
 int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
                 Context, Runtime*) {
-  const Launch& launch = **static_cast<Launch* const*>(task->args);
+  Launch& launch = **static_cast<Launch* const*>(task->args);
   UpmemModule& mod = upmem_module();
   RankDPU* rank = mod.get_task_dpu();
   dpu_set_t* stream = mod.get_task_upmem_stream();
@@ -237,7 +239,8 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
 
   const uint32_t nr = rank->nr_dpus;
   LegionShard shard(launch, regions, *rank, rank_index(rank) * nr);
-  std::vector<DPU_LAUNCH_ARGS> args(nr);
+  std::vector<DPU_LAUNCH_ARGS>& args = launch.args[task->index_point[0]];
+  args.resize(nr);
   for (uint32_t d = 0; d < nr; d++) {
     shard.at(d);
     check_aligned(launch, shard);
@@ -250,8 +253,9 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   ensure_binary(*rank, stream, launch.binary);
   for (uint32_t d = 0; d < nr; d++)
     CHECK_UPMEM(dpu_prepare_xfer(rank->dpu_handles[d], &args[d]));
+  // Async: a sync transfer behind pending async work can crash the SDK.
   CHECK_UPMEM(dpu_push_xfer(*stream, DPU_XFER_TO_DPU, "args", 0,
-                            sizeof(DPU_LAUNCH_ARGS), DPU_XFER_DEFAULT));
+                            sizeof(DPU_LAUNCH_ARGS), DPU_XFER_ASYNC));
   CHECK_UPMEM(dpu_launch(*stream, DPU_ASYNCHRONOUS));
   return 0;
 }
@@ -519,6 +523,7 @@ class LegionBackend final : public DpuBackend {
     for (const auto& vec : writes) add(vec, LEGION_WRITE_DISCARD);
 
     const Placement placement = place(pending->operands, regions);
+    pending->args.resize(placement.ranks);
 
     Launch* raw = pending.get();
     IndexLauncher launcher(KERNEL_TASK_ID, colors(placement.ranks),
