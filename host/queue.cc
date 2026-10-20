@@ -211,6 +211,14 @@ bool EventQueue::try_fuse(std::shared_ptr<Event> last,
   }
   if (unique.size() > MAX_COMBINED_INPUTS) return false;
 
+  // Chains the backend placed apart would have to move to share a kernel.
+  std::vector<detail::VectorDescRef> touched = unique;
+  for (const auto& out : {last->output, e->output})
+    if (out) touched.push_back(out);
+  touched.insert(touched.end(), last->extra_outputs.begin(),
+                 last->extra_outputs.end());
+  if (!DpuRuntime::get().backend().can_share_kernel(touched)) return false;
+
   // Hold back events a vfuse candidate is likely to want: hfusing them now
   // spends an extra_output slot and blocks the deeper vertical chain.  A fresh
   // scalar op is usually about to be consumed by an accumulator (linreg's
