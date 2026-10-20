@@ -540,6 +540,9 @@ class LegionBackend final : public DpuBackend {
   // Legion orders dependent work, so there is nothing to wait for.
   void notify(std::function<void()> done) override { done(); }
 
+  // Completion is reported at issue, so draining needs no wait.
+  void progress() override {}
+
   void sync() override {
     runtime_->issue_execution_fence(ctx_).get_void_result();
     reap(true);
