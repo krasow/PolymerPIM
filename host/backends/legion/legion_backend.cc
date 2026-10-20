@@ -318,15 +318,13 @@ std::vector<std::string> legion_args(uint32_t num_dpus) {
       std::max<uint32_t>(1, (num_dpus + REALM_UPMEM_MAX_DPUS_PER_RANK - 1) /
                                 REALM_UPMEM_MAX_DPUS_PER_RANK);
   const uint32_t sysmem_mb = std::min<uint32_t>(ranks * 4096, 65536);
-  std::vector<std::string> args = {"polymerpim",
-                                   "-ll:num_ranks",
-                                   std::to_string(ranks),
-                                   "-ll:dpu_layout",
-                                   "blocked",
-                                   "-ll:dpu_granule",
-                                   "8",
-                                   "-ll:csize",
-                                   std::to_string(sysmem_mb)};
+  // Utility threads run Legion's analysis; one per rank pair, from 2 to 4.
+  const uint32_t util = std::clamp<uint32_t>(ranks / 2, 2, 4);
+  std::vector<std::string> args = {
+      "polymerpim", "-ll:num_ranks",          std::to_string(ranks),
+      "-ll:util",   std::to_string(util),     "-ll:dpu_layout",
+      "blocked",    "-ll:dpu_granule",        "8",
+      "-ll:csize",  std::to_string(sysmem_mb)};
   if (const char* extra = std::getenv("POLYMERPIM_LEGION_ARGS")) {
     std::istringstream in(extra);
     for (std::string word; in >> word;) args.push_back(word);
