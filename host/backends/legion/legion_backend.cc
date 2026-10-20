@@ -548,6 +548,23 @@ class LegionBackend final : public DpuBackend {
   // Completion is reported at issue, so draining needs no wait.
   void progress() override {}
 
+  // Unplaced vectors join any placement; placed ones must agree.
+  bool can_share_kernel(
+      const std::vector<detail::VectorDescRef>& vecs) override {
+    const Storage* anchor = nullptr;
+    for (const auto& vec : vecs) {
+      if (!vec) continue;
+      const Storage& s = storage_of(*vec);
+      if (!s.placed) continue;
+      if (!anchor)
+        anchor = &s;
+      else if (s.placement.first != anchor->placement.first ||
+               s.placement.ranks != anchor->placement.ranks)
+        return false;
+    }
+    return true;
+  }
+
   void sync() override {
     runtime_->issue_execution_fence(ctx_).get_void_result();
     reap(true);

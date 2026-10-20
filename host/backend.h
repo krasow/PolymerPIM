@@ -88,6 +88,10 @@ class DpuBackend {
   virtual void sync() = 0;
   // Lets pending notifications fire while the queue drains.
   virtual void progress() { sync(); }
+  // Whether one kernel can use all of `vecs` without moving any.
+  virtual bool can_share_kernel(const std::vector<detail::VectorDescRef>&) {
+    return true;
+  }
 
   virtual void read_logs(FILE* out) = 0;
 };
