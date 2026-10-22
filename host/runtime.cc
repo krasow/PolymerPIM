@@ -1,10 +1,4 @@
-#ifndef DPURT
-#define DPURT
 #include <cstdlib>
-#include <dpu>  // UPMEM rt syslib
-#define CHECK_UPMEM(x) DPU_ASSERT(x)
-#endif
-
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -26,10 +20,9 @@ namespace fs = std::filesystem;
 
 std::string get_runtime_dpu_binary();
 
-allocator& DpuRuntime::get_allocator() { return *allocator_; }
 EventQueue& DpuRuntime::get_event_queue() { return *event_queue_; }
 Logger& DpuRuntime::get_logger() { return *logger_; }
-dpu_set_t& DpuRuntime::dpu_set() { return *dpu_set_; }
+DpuBackend& DpuRuntime::backend() { return *backend_; }
 uint32_t DpuRuntime::num_dpus() const { return num_dpus_; }
 
 uint32_t DpuRuntime::configured_num_dpus() {
@@ -93,38 +86,18 @@ void DpuRuntime::init(uint32_t num_dpus) {
                                  << num_dpus_ << " DPUs..." << std::endl;
 #endif
 
-  std::string backend_str = "backend=";
-  backend_str += BACKEND;
-
-  // Allocate DPU set
-  dpu_set_ = new dpu_set_t();
-
-  DPU_ASSERT(dpu_alloc(num_dpus_, backend_str.c_str(), dpu_set_));
-
-  // Update num_dpus_ to actual allocated count
-  uint32_t actual_dpus;
-  DPU_ASSERT(dpu_get_nr_dpus(*dpu_set_, &actual_dpus));
-  num_dpus_ = actual_dpus;
+  // Allocate the DPUs and load the default binary
+  std::string dpu_file = get_runtime_dpu_binary();
+  backend_ = make_native_backend();
+  num_dpus_ = backend_->open(num_dpus_, dpu_file);
 
 #if ENABLE_DPU_LOGGING >= 1
   logger_->lock(logcat::RUNTIME)
       << "Allocated " << num_dpus_ << " DPUs..." << std::endl;
-#endif
-
-  // Load DPU binary
-  std::string dpu_file = get_runtime_dpu_binary();
-  DPU_ASSERT(dpu_load(*dpu_set_, dpu_file.c_str(), nullptr));
-
-#if ENABLE_DPU_LOGGING >= 1
   logger_->lock(logcat::RUNTIME)
-      << "DPU runtime initialized with " << backend_str << std::endl;
+      << "DPU runtime initialized with backend=" << BACKEND << std::endl;
 #endif
 
-  // Allocate allocator and event queue
-  size_t dpu_mem = 64 * 1024 * 1024;  // 64MB per DPU
-  // Constructor: allocator(uint32_t start_addr, std::size_t dpu_mem,
-  // std::size_t num_dpus)
-  allocator_ = std::make_unique<allocator>(0, dpu_mem, num_dpus_);
   event_queue_ = std::make_unique<EventQueue>();
 
   initialized_ = true;
@@ -168,10 +141,9 @@ void DpuRuntime::shutdown() {
 
     if (logger_)
       logger_->lock(logcat::RUNTIME) << "Freeing DPU set..." << std::endl;
-    if (dpu_set_) {
-      DPU_ASSERT(dpu_free(*dpu_set_));
-      delete dpu_set_;
-      dpu_set_ = nullptr;
+    if (backend_) {
+      backend_->close();
+      backend_.reset();
     }
     initialized_ = false;
   }  // trace_scoped ends here, before TRACE_SHUTDOWN
@@ -194,12 +166,7 @@ void DpuRuntime::shutdown() {
 
   // Reset core systems explicitly so they don't hang in static destructor
   event_queue_.reset();
-  allocator_.reset();
   logger_.reset();
 }
 
-void DpuRuntime::debug_read_dpu_log() {
-  dpu_set_t dpu;
-  dpu_set_t& set = this->dpu_set();
-  DPU_FOREACH(set, dpu) { DPU_ASSERT(dpu_log_read(dpu, stdout)); }
-}
+void DpuRuntime::debug_read_dpu_log() { backend().read_logs(stdout); }

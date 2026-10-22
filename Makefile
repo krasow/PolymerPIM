@@ -87,7 +87,8 @@ TEST_TARGET := ${TEST_DIR}/polymerpim_test
 COMMON_DIR := common
 HOST_INCLUDES := host
 HOST_SOURCES := $(wildcard ${HOST_DIR}/*.cc) $(wildcard ${HOST_DIR}/detail/*.cc) \
-                $(wildcard ${HOST_DIR}/perfetto/*.cc)
+                $(wildcard ${HOST_DIR}/perfetto/*.cc) \
+                $(wildcard ${HOST_DIR}/backends/native/*.cc)
 DPU_SOURCES := $(wildcard ${DPU_DIR}/*.c)
 # One binary holds every suite; select subsets at run time with --filter.
 TEST_SOURCES := $(wildcard ${TEST_DIR}/*.cc)
@@ -97,7 +98,8 @@ HOST_HEADERS := $(wildcard ${HOST_DIR}/*.inl) $(wildcard ${HOST_DIR}/*.h) \
                 $(wildcard ${HOST_DIR}/detail/*.h) \
                 $(wildcard ${HOST_DIR}/detail/*.inl) \
                 $(wildcard ${HOST_DIR}/perfetto/*.h) \
-                $(wildcard ${HOST_DIR}/perfetto/detail/*.h)
+                $(wildcard ${HOST_DIR}/perfetto/detail/*.h) \
+                $(wildcard ${HOST_DIR}/backends/native/*.h)
 DPU_HEADERS := $(wildcard ${DPU_DIR}/*.inl) $(wildcard ${DPU_DIR}/*.h)
 COMMON_HEADERS := ${COMMON_DIR}/common.h ${COMMON_DIR}/config.h
 
