@@ -132,6 +132,10 @@ class dpu_vector {
   // transfer is queued, so the buffer must outlive it -- add_fence() first.
   static dpu_vector<T> from_cpu(T* cpu_data, size_t n,
                                 LOGGER_ARGS_WITH_DEFAULTS);
+  // `n_per_dpu` elements on every DPU, read back in DPU order: storage for
+  // per-DPU results such as reduction partials.
+  static dpu_vector<T> per_dpu(size_t n_per_dpu, uint32_t reserved = 0,
+                               bool lazy = false, LOGGER_ARGS_WITH_DEFAULTS);
   void add_fence();
   dpu_vector<T>& operator+=(const dpu_vector<T>& other);
   dpu_vector<T>& operator-=(const dpu_vector<T>& other);
@@ -162,6 +166,11 @@ class dpu_vector {
   const char* debug_file = nullptr;
   int debug_line = -1;
   mutable bool copied = false;
+
+  struct per_dpu_tag {};
+  dpu_vector(per_dpu_tag, size_t n_per_dpu, uint32_t reserved, bool lazy,
+             std::string_view name, std::source_location loc);
+  void bind_storage(detail::VectorDescRef data);
 
   static std::vector<uint8_t> prepare_rpn(const std::vector<uint8_t>& ops);
 

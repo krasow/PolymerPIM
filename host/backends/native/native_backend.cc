@@ -93,6 +93,14 @@ class NativeBackend final : public DpuBackend {
     return allocator_->allocate_upmem_vector(n, reserved, element_size, lazy);
   }
 
+  // One shard per DPU is exactly what sharding num_dpus * n_per_dpu
+  // elements gives.
+  detail::VectorDescRef allocate_per_dpu(size_t n_per_dpu, size_t reserved,
+                                         size_t element_size,
+                                         bool lazy) override {
+    return allocate(num_dpus_ * n_per_dpu, reserved, element_size, lazy);
+  }
+
   detail::VectorDescRef allocate_local(size_t n, size_t element_size) override {
     return allocator_->allocate_local_vector(n, element_size);
   }
@@ -117,6 +125,10 @@ class NativeBackend final : public DpuBackend {
          vec->desc[0].allocated_bytes - vec->reserved_bytes);
   }
 
+  detail::ShardLayout read_layout(const detail::VectorDesc& vec) override {
+    return detail::shard_layout(vec);
+  }
+
   void read(const detail::VectorDescRef& vec, char* host,
             size_t stride) override {
     realize(vec);
@@ -126,10 +138,12 @@ class NativeBackend final : public DpuBackend {
     push(DPU_XFER_FROM_DPU, host_ptrs, vec->desc[0].ptr, stride);
   }
 
-  void launch(const std::vector<detail::VectorDescRef>& vectors,
+  void launch(const std::vector<detail::VectorDescRef>& reads,
+              const std::vector<detail::VectorDescRef>& writes,
               const FillArgs& fill, const InspectArgs& inspect) override {
-    for (const auto& vec : vectors)
-      if (vec) realize(vec);
+    for (const auto* list : {&reads, &writes})
+      for (const auto& vec : *list)
+        if (vec) realize(vec);
 
     // Left uninitialised like the stack arrays this replaced; `fill` writes
     // what the kernel reads.

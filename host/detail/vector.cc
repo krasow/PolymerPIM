@@ -44,6 +44,9 @@ void vec_xfer_from_dpu_strided(char* cpu, VectorDescRef desc, size_t stride) {
   DpuRuntime::get().backend().read(desc, cpu, stride);
 }
 
+// The argument callbacks below capture by value: a backend may run them after
+// launch() returns, once it knows where each shard landed.
+
 namespace {
 DpuBackend::InspectArgs log_launch_args() {
 #if ENABLE_DPU_LOGGING >= 1
@@ -58,7 +61,7 @@ DpuBackend::InspectArgs log_launch_args() {
 
 void internal_launch_binary_scalar(VectorDescRef res, VectorDescRef lhs,
                                    uint32_t scalar, KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args = {};
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_BINARY_SCALAR);
@@ -68,12 +71,12 @@ void internal_launch_binary_scalar(VectorDescRef res, VectorDescRef lhs,
     args.binary_scalar.rhs_scalar = scalar;
     args.binary_scalar.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, lhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({lhs}, {res}, fill, log_launch_args());
 }
 
 void internal_launch_fill(VectorDescRef res, uint32_t value,
                           KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args = {};
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_FILL);
@@ -83,12 +86,12 @@ void internal_launch_fill(VectorDescRef res, uint32_t value,
     args.binary_scalar.rhs_scalar = value;
     args.binary_scalar.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({}, {res}, fill, log_launch_args());
 }
 
 void internal_launch_binary(VectorDescRef res, VectorDescRef lhs,
                             VectorDescRef rhs, KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_BINARY);
     args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
@@ -97,12 +100,13 @@ void internal_launch_binary(VectorDescRef res, VectorDescRef lhs,
     args.binary.rhs_offset = s.offset(*rhs);
     args.binary.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, lhs, rhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({lhs, rhs}, {res}, fill,
+                                     log_launch_args());
 }
 
 void internal_launch_unary(VectorDescRef res, VectorDescRef rhs,
                            KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_PIPELINE);
     args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
@@ -110,12 +114,12 @@ void internal_launch_unary(VectorDescRef res, VectorDescRef rhs,
     args.unary.rhs_offset = s.offset(*rhs);
     args.unary.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, rhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({rhs}, {res}, fill, log_launch_args());
 }
 
 void internal_launch_reduction(VectorDescRef res, VectorDescRef rhs,
                                KernelID kernel_id) {
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_REDUCTION);
     args.num_elements = s.size_bytes(*rhs) / rhs->element_size;
@@ -123,7 +127,7 @@ void internal_launch_reduction(VectorDescRef res, VectorDescRef rhs,
     args.reduction.rhs_offset = s.offset(*rhs);
     args.reduction.res_offset = s.offset(*res);
   };
-  DpuRuntime::get().backend().launch({res, rhs}, fill, log_launch_args());
+  DpuRuntime::get().backend().launch({rhs}, {res}, fill, log_launch_args());
 }
 
 #if PIPELINE
@@ -145,11 +149,15 @@ void internal_launch_universal_pipeline(
                              "); rebuild with JIT=1 or raise MAX_VFUSE_OPS");
 #endif
 
-  std::vector<VectorDescRef> vectors = {res, init};
-  vectors.insert(vectors.end(), operands.begin(), operands.end());
-  vectors.insert(vectors.end(), extra_outputs.begin(), extra_outputs.end());
+  // Extra outputs may be local vectors the kernel accumulates into, so they
+  // are read as well as written.
+  std::vector<VectorDescRef> reads = {init};
+  reads.insert(reads.end(), operands.begin(), operands.end());
+  reads.insert(reads.end(), extra_outputs.begin(), extra_outputs.end());
+  std::vector<VectorDescRef> writes = {res};
+  writes.insert(writes.end(), extra_outputs.begin(), extra_outputs.end());
 
-  auto fill = [&](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
+  auto fill = [=](DPU_LAUNCH_ARGS& args, const DpuBackend::Shard& s) {
     args.kernel = static_cast<uint32_t>(kernel_id);
     args.ktype = static_cast<uint8_t>(KERNEL_UNARY);
 
@@ -209,17 +217,17 @@ void internal_launch_universal_pipeline(
 
   DpuBackend::InspectArgs inspect;
 #if ENABLE_DPU_LOGGING >= 1
-  inspect = [&](const DPU_LAUNCH_ARGS* args, uint32_t nr_of_dpus) {
+  inspect = [ops, hash = std::string(kernel_hash)](const DPU_LAUNCH_ARGS* args,
+                                                   uint32_t nr_of_dpus) {
     detail::FusionRpnSummary rpn_summary = detail::summarize_fusion_rpn(ops);
     log_dpu_launch_args(DpuRuntime::get().get_logger(), args, nr_of_dpus,
-                        rpn_summary.decoded_ops, rpn_summary.chains,
-                        kernel_hash);
+                        rpn_summary.decoded_ops, rpn_summary.chains, hash);
   };
 #else
   (void)kernel_hash;
 #endif
 
-  DpuRuntime::get().backend().launch(vectors, fill, inspect);
+  DpuRuntime::get().backend().launch(reads, writes, fill, inspect);
 }
 #endif
 
