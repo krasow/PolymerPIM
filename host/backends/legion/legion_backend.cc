@@ -14,6 +14,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include "backend.h"
 #include "default_mapper.h"
@@ -267,14 +268,24 @@ struct HostCopy {
   size_t element_size;
 };
 
-void write_task(const Task* task, const std::vector<PhysicalRegion>& regions,
-                Context, Runtime*) {
-  const HostCopy& copy = *static_cast<const HostCopy*>(task->args);
-  const Rect<1> rect = regions[0].get_bounds<1, coord_t>().bounds;
-  FieldAccessor<LEGION_WRITE_DISCARD, uint8_t, 1, coord_t,
-                Realm::AffineAccessor<uint8_t, 1, coord_t>>
-      acc(regions[0], FID_DATA, copy.element_size);
-  std::memcpy(acc.ptr(rect.lo), copy.host, copy.bytes);
+// Large host copies are bandwidth-bound on one thread; split them.
+void parallel_memcpy(void* dst, const void* src, size_t bytes) {
+  constexpr size_t kSerial = size_t{64} << 20, kAlign = 4096;
+  const size_t threads = std::min<size_t>(
+      16, std::max(1u, std::thread::hardware_concurrency() / 2));
+  if (bytes < kSerial || threads < 2) {
+    std::memcpy(dst, src, bytes);
+    return;
+  }
+  const size_t chunk = (bytes / threads + kAlign - 1) / kAlign * kAlign;
+  std::vector<std::thread> workers;
+  for (size_t off = 0; off < bytes; off += chunk)
+    workers.emplace_back([=] {
+      std::memcpy(static_cast<char*>(dst) + off,
+                  static_cast<const char*>(src) + off,
+                  std::min(chunk, bytes - off));
+    });
+  for (auto& w : workers) w.join();
 }
 
 void read_task(const Task* task, const std::vector<PhysicalRegion>& regions,
@@ -284,7 +295,7 @@ void read_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   FieldAccessor<LEGION_READ_ONLY, uint8_t, 1, coord_t,
                 Realm::AffineAccessor<uint8_t, 1, coord_t>>
       acc(regions[0], FID_DATA, copy.element_size);
-  std::memcpy(copy.host, acc.ptr(rect.lo), copy.bytes);
+  parallel_memcpy(copy.host, acc.ptr(rect.lo), copy.bytes);
 }
 
 void register_tasks() {
@@ -295,13 +306,6 @@ void register_tasks() {
     registrar.set_leaf();
     Runtime::preregister_task_variant<int, kernel_task>(registrar,
                                                         "polymerpim_kernel");
-  }
-  {
-    TaskVariantRegistrar registrar(WRITE_TASK_ID, "polymerpim_write");
-    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
-    registrar.set_leaf();
-    Runtime::preregister_task_variant<write_task>(registrar,
-                                                  "polymerpim_write");
   }
   {
     TaskVariantRegistrar registrar(READ_TASK_ID, "polymerpim_read");
@@ -446,14 +450,15 @@ class LegionBackend final : public DpuBackend {
     const Storage& s = storage_of(*vec);
     if (s.per_dpu)
       throw std::logic_error("per-DPU vectors are written only by kernels");
-    // Waited on so the caller may free `host` once the event retires.
-    HostCopy copy{const_cast<char*>(host), vec->num_elements * s.element_size,
-                  s.element_size};
-    TaskLauncher launcher(WRITE_TASK_ID, TaskArgument(&copy, sizeof(copy)));
-    launcher.add_region_requirement(RegionRequirement(
-        s.region, LEGION_WRITE_DISCARD, LEGION_EXCLUSIVE, s.region));
-    launcher.add_field(0, FID_DATA);
-    runtime_->execute_task(ctx_, launcher).get_void_result();
+    // Copied before returning, so the caller may free `host` once the event
+    // retires.
+    PhysicalRegion pr = map_inline(s, LEGION_WRITE_DISCARD);
+    FieldAccessor<LEGION_WRITE_DISCARD, uint8_t, 1, coord_t,
+                  Realm::AffineAccessor<uint8_t, 1, coord_t>>
+        acc(pr, FID_DATA, s.element_size);
+    parallel_memcpy(acc.ptr(Point<1>(0)), host,
+                    vec->num_elements * s.element_size);
+    runtime_->unmap_region(ctx_, pr);
   }
 
   // A per-DPU vector spans the ranks of the kernel that writes it.
@@ -731,13 +736,24 @@ class LegionBackend final : public DpuBackend {
     return it->second;
   }
 
+  // Host copies run on this (unpinned) thread: Realm pins its task threads to
+  // one core, which would serialise parallel_memcpy.
+  PhysicalRegion map_inline(const Storage& s, PrivilegeMode privilege) {
+    InlineLauncher launcher(
+        RegionRequirement(s.region, privilege, LEGION_EXCLUSIVE, s.region));
+    launcher.add_field(FID_DATA);
+    PhysicalRegion pr = runtime_->map_region(ctx_, launcher);
+    pr.wait_until_valid();
+    return pr;
+  }
+
   void read_region(const Storage& s, char* host, size_t bytes) {
-    HostCopy copy{host, bytes, s.element_size};
-    TaskLauncher launcher(READ_TASK_ID, TaskArgument(&copy, sizeof(copy)));
-    launcher.add_region_requirement(RegionRequirement(
-        s.region, LEGION_READ_ONLY, LEGION_EXCLUSIVE, s.region));
-    launcher.add_field(0, FID_DATA);
-    runtime_->execute_task(ctx_, launcher).get_void_result();
+    PhysicalRegion pr = map_inline(s, LEGION_READ_ONLY);
+    FieldAccessor<LEGION_READ_ONLY, uint8_t, 1, coord_t,
+                  Realm::AffineAccessor<uint8_t, 1, coord_t>>
+        acc(pr, FID_DATA, s.element_size);
+    parallel_memcpy(host, acc.ptr(Point<1>(0)), bytes);
+    runtime_->unmap_region(ctx_, pr);
   }
 
   // Frees finished launches on the context's thread: their callbacks hold
