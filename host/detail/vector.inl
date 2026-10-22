@@ -39,17 +39,47 @@ dpu_vector<T>::dpu_vector(size_t n, uint32_t reserved, bool lazy,
   if (runtime.is_initialized() == false) {
     runtime.init(DpuRuntime::configured_num_dpus());
   }
-  data_ = runtime.backend().allocate(n, reserved, sizeof(T), lazy);
+  bind_storage(runtime.backend().allocate(n, reserved, sizeof(T), lazy));
+}
+
+template <typename T>
+dpu_vector<T>::dpu_vector(per_dpu_tag, size_t n_per_dpu, uint32_t reserved,
+                          bool lazy, std::string_view name,
+                          std::source_location loc)
+    : reserved_(reserved),
+      debug_name(name.data()),
+      debug_file(loc.file_name()),
+      debug_line(loc.line()) {
+  auto& runtime = DpuRuntime::get();
+  if (runtime.is_initialized() == false) {
+    runtime.init(DpuRuntime::configured_num_dpus());
+  }
+  size_ = n_per_dpu * runtime.num_dpus();
+  bind_storage(
+      runtime.backend().allocate_per_dpu(n_per_dpu, reserved, sizeof(T), lazy));
+}
+
+template <typename T>
+dpu_vector<T> dpu_vector<T>::per_dpu(size_t n_per_dpu, uint32_t reserved,
+                                     bool lazy, std::string_view name,
+                                     std::source_location loc) {
+  return dpu_vector<T>(per_dpu_tag{}, n_per_dpu, reserved, lazy, name, loc);
+}
+
+template <typename T>
+void dpu_vector<T>::bind_storage(detail::VectorDescRef data) {
+  data_ = std::move(data);
   data_->type_name = typeid(T).name();
   data_->debug_name = debug_name;
   data_->debug_file = debug_file;
   data_->debug_line = debug_line;
   detail::retain_handle(data_);
 #if ENABLE_DPU_LOGGING >= 1
-  Logger& logger = runtime.get_logger();
-  log_allocation(
-      logger, typeid(T), n, data_->vector_id, data_->allocated_footprint_bytes,
-      !data_->needs_layout_materialization, debug_name, debug_file, debug_line);
+  Logger& logger = DpuRuntime::get().get_logger();
+  log_allocation(logger, typeid(T), size_, data_->vector_id,
+                 data_->allocated_footprint_bytes,
+                 !data_->needs_layout_materialization, debug_name, debug_file,
+                 debug_line);
 #endif
 }
 
@@ -176,7 +206,7 @@ vector<T> dpu_vector<T>::to_cpu() {
   auto desc = this->data_desc_ref();
   DpuRuntime::get().backend().realize(desc);
   const size_t result_elems =
-      detail::shard_layout(*desc).total_logical / sizeof(T);
+      DpuRuntime::get().backend().read_layout(*desc).total_logical / sizeof(T);
 
   vector<T> cpu_vec(result_elems);
   to_cpu_into(cpu_vec.data(), result_elems);
@@ -192,7 +222,8 @@ size_t dpu_vector<T>::to_cpu_into(T* out, size_t capacity) {
   // One transfer size applies to every DPU, so ragged shards have to land in a
   // padded staging buffer and be compacted afterwards.  When every shard's
   // payload already fills the stride we read straight into the result.
-  const detail::ShardLayout layout = detail::shard_layout(*desc);
+  const detail::ShardLayout layout =
+      DpuRuntime::get().backend().read_layout(*desc);
   const size_t result_elems = layout.total_logical / sizeof(T);
   const size_t n = std::min(result_elems, capacity);
 
@@ -767,8 +798,8 @@ lazy_reduction_result<T> dpu_vector<T>::pipeline_reduce(
   // mram_write minimum alignment and size requirements.
   size_t elems_per_dpu = (8 + sizeof(T) - 1) / sizeof(T);
 
-  dpu_vector<T> res(runtime.num_dpus() * elems_per_dpu,
-                    runtime.num_tasklets() * 8, true);
+  auto res =
+      dpu_vector<T>::per_dpu(elems_per_dpu, runtime.num_tasklets() * 8, true);
   res.data_desc_ref()->type_name = typeid(T).name();
   res.data_desc_ref()->is_reduction_result = true;
   res.data_desc_ref()->reduction_rid = rid;
@@ -796,7 +827,7 @@ lazy_arg_reduction_result<T> dpu_vector<T>::pipeline_argreduce(
   auto& runtime = DpuRuntime::get();
 
   // One 8-byte {value,index} result per DPU.
-  dpu_vector<T> res(runtime.num_dpus() * 2, runtime.num_tasklets() * 8, true);
+  auto res = dpu_vector<T>::per_dpu(2, runtime.num_tasklets() * 8, true);
   res.data_desc_ref()->type_name = typeid(T).name();
   res.data_desc_ref()->is_reduction_result = true;
   res.data_desc_ref()->reduction_rid =
@@ -838,8 +869,7 @@ dpu_vector<T> abs(const dpu_vector<T>& a) {
 template <typename T>
 lazy_reduction_result<T> sum(const dpu_vector<T>& a) {
   auto& runtime = DpuRuntime::get();
-  dpu_vector<T> buf(runtime.num_dpus(),
-                    runtime.num_tasklets() * sizeof(size_t));
+  auto buf = dpu_vector<T>::per_dpu(1, runtime.num_tasklets() * sizeof(size_t));
   buf.data_desc_ref()->type_name = typeid(T).name();
   buf.data_desc_ref()->debug_name = "reduction_buffer";
   buf.data_desc_ref()->debug_file = __FILE__;
@@ -853,8 +883,7 @@ lazy_reduction_result<T> sum(const dpu_vector<T>& a) {
 template <typename T>
 lazy_reduction_result<T> product(const dpu_vector<T>& a) {
   auto& runtime = DpuRuntime::get();
-  dpu_vector<T> buf(runtime.num_dpus(),
-                    runtime.num_tasklets() * sizeof(size_t));
+  auto buf = dpu_vector<T>::per_dpu(1, runtime.num_tasklets() * sizeof(size_t));
   buf.data_desc_ref()->type_name = typeid(T).name();
   buf.data_desc_ref()->debug_name = "reduction_buffer";
   buf.data_desc_ref()->debug_file = __FILE__;
@@ -868,8 +897,8 @@ lazy_reduction_result<T> product(const dpu_vector<T>& a) {
 template <typename T>
 lazy_reduction_result<T> min(const dpu_vector<T>& a) {
   auto& runtime = DpuRuntime::get();
-  dpu_vector<T> buf(runtime.num_dpus(), runtime.num_tasklets() * sizeof(size_t),
-                    true);
+  auto buf =
+      dpu_vector<T>::per_dpu(1, runtime.num_tasklets() * sizeof(size_t), true);
   buf.data_desc_ref()->type_name = typeid(T).name();
   buf.data_desc_ref()->debug_name = "reduction_buffer";
   buf.data_desc_ref()->debug_file = __FILE__;
@@ -883,8 +912,7 @@ lazy_reduction_result<T> min(const dpu_vector<T>& a) {
 template <typename T>
 lazy_reduction_result<T> max(const dpu_vector<T>& a) {
   auto& runtime = DpuRuntime::get();
-  dpu_vector<T> buf(runtime.num_dpus(),
-                    runtime.num_tasklets() * sizeof(size_t));
+  auto buf = dpu_vector<T>::per_dpu(1, runtime.num_tasklets() * sizeof(size_t));
   buf.data_desc_ref()->type_name = typeid(T).name();
   buf.data_desc_ref()->debug_name = "reduction_buffer";
   buf.data_desc_ref()->debug_file = __FILE__;
@@ -1108,7 +1136,7 @@ vector<T> dpu_local_vector<T>::to_cpu() {
 
   // DPU transfers use the aligned shard stride, not the logical payload size.
   // Stage the padding and merge only logical elements.
-  const detail::ShardLayout layout = detail::shard_layout(*data_);
+  const detail::ShardLayout layout = runtime.backend().read_layout(*data_);
   const size_t stride = layout.stride;
   std::vector<char> all_data(layout.padded_bytes());
   char* cpu_buffer = all_data.data();
