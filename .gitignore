@@ -39,3 +39,6 @@ benchmarks/**/data/
 benchmarks/**/generate_ref
 benchmarks/**/run
 benchmarks/results/
+
+# upmem-legion build outputs (legion/Makefile)
+legion/*_defines.h
