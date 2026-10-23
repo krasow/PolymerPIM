@@ -31,6 +31,14 @@ using namespace Legion;
 using namespace polymerpim_legion;
 using Realm::Upmem::UpmemModule;
 using RankDPU = Realm::Upmem::DPU;
+
+// Below LEGION_MAX_APPLICATION_TASK_ID.
+enum : TaskID {
+  KERNEL_TASK_ID = 0x504d1,
+  WRITE_TASK_ID,
+  READ_TASK_ID,
+  TOP_LEVEL_TASK_ID,
+};
 constexpr FieldID FID_DATA = 1;
 
 UpmemModule& upmem_module() {
@@ -366,6 +374,9 @@ class LegionBackend final : public DpuBackend {
             "DPUs");
     num_ranks_ = (uint32_t)ranks.size();
     num_dpus_ = num_ranks_ * dpus_per_rank_;
+
+    colors_ =
+        runtime_->create_index_space(ctx_, Rect<1>(0, (coord_t)num_ranks_ - 1));
 
     load(binary);
     open_ = true;
