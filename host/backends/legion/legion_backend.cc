@@ -318,15 +318,13 @@ std::vector<std::string> legion_args(uint32_t num_dpus) {
       std::max<uint32_t>(1, (num_dpus + REALM_UPMEM_MAX_DPUS_PER_RANK - 1) /
                                 REALM_UPMEM_MAX_DPUS_PER_RANK);
   const uint32_t sysmem_mb = std::min<uint32_t>(ranks * 4096, 65536);
-  std::vector<std::string> args = {"polymerpim",
-                                   "-ll:num_ranks",
-                                   std::to_string(ranks),
-                                   "-ll:dpu_layout",
-                                   "blocked",
-                                   "-ll:dpu_granule",
-                                   "8",
-                                   "-ll:csize",
-                                   std::to_string(sysmem_mb)};
+  // Utility threads run Legion's analysis; one per rank pair, from 2 to 4.
+  const uint32_t util = std::clamp<uint32_t>(ranks / 2, 2, 4);
+  std::vector<std::string> args = {
+      "polymerpim", "-ll:num_ranks",          std::to_string(ranks),
+      "-ll:util",   std::to_string(util),     "-ll:dpu_layout",
+      "blocked",    "-ll:dpu_granule",        "8",
+      "-ll:csize",  std::to_string(sysmem_mb)};
   if (const char* extra = std::getenv("POLYMERPIM_LEGION_ARGS")) {
     std::istringstream in(extra);
     for (std::string word; in >> word;) args.push_back(word);
@@ -375,6 +373,9 @@ class LegionBackend final : public DpuBackend {
   void close() override {
     if (!open_) return;
     sync();
+    // Futures must not outlive the runtime.
+    for (auto& [vec, s] : storage_) retire_prefetch(s);
+    reap(true);
     for (const auto& [count, space] : colors_)
       runtime_->destroy_index_space(ctx_, space);
     runtime_->finish_implicit_task(ctx_);
@@ -430,7 +431,8 @@ class LegionBackend final : public DpuBackend {
     std::lock_guard<std::mutex> lock(mtx_);
     auto it = storage_.find(&vec);
     if (it == storage_.end()) return;
-    const Storage& s = it->second;
+    Storage& s = it->second;
+    retire_prefetch(s);
     if (s.region.exists()) {
       runtime_->destroy_logical_region(ctx_, s.region);
       runtime_->destroy_field_space(ctx_, s.region.get_field_space());
@@ -491,13 +493,20 @@ class LegionBackend final : public DpuBackend {
     const uint32_t ranks = s.placement.ranks;
     const size_t shard =
         realm_upmem_block_shard(s.piece_bytes, dpus_per_rank_, granule_);
-    std::vector<char> pieces(s.piece_bytes * ranks);
-    read_region(s, pieces.data(), pieces.size());
+    std::vector<char> fetched;
+    const char* pieces;
+    if (s.prefetch) {
+      s.prefetch->done.get_void_result();
+      pieces = s.prefetch->data.data();
+    } else {
+      fetched.resize(s.piece_bytes * ranks);
+      read_region(s, fetched.data(), fetched.size());
+      pieces = fetched.data();
+    }
     for (uint32_t r = 0; r < ranks; r++)
       for (uint32_t d = 0; d < dpus_per_rank_; d++)
         std::memcpy(host + (size_t)(r * dpus_per_rank_ + d) * stride,
-                    pieces.data() + r * s.piece_bytes + d * shard,
-                    s.payload_bytes);
+                    pieces + r * s.piece_bytes + d * shard, s.payload_bytes);
   }
 
   void launch(const std::vector<detail::VectorDescRef>& reads,
@@ -537,9 +546,19 @@ class LegionBackend final : public DpuBackend {
           Mapping::DefaultMapper::EXACT_REGION));
       launcher.add_field((unsigned)i, FID_DATA);
     }
+    // Small per-DPU results (reduction partials) are read next; fetch them
+    // as soon as they are written so several reads overlap.
+    std::vector<Storage*> fetch;
+    for (size_t i = 0; i < regions.size(); i++)
+      if (regions[i]->per_dpu &&
+          pending->operands[i].privilege != LEGION_READ_ONLY &&
+          regions[i]->region_elements * regions[i]->element_size <= (1u << 20))
+        fetch.push_back(regions[i]);
+
     Future done =
         runtime_->execute_index_space(ctx_, launcher, LEGION_REDOP_SUM_INT32);
     inflight_.push_back({done, std::move(pending)});
+    for (Storage* s : fetch) prefetch(*s);
   }
 
   // Legion orders dependent work, so there is nothing to wait for.
@@ -547,6 +566,23 @@ class LegionBackend final : public DpuBackend {
 
   // Completion is reported at issue, so draining needs no wait.
   void progress() override {}
+
+  // Unplaced vectors join any placement; placed ones must agree.
+  bool can_share_kernel(
+      const std::vector<detail::VectorDescRef>& vecs) override {
+    const Storage* anchor = nullptr;
+    for (const auto& vec : vecs) {
+      if (!vec) continue;
+      const Storage& s = storage_of(*vec);
+      if (!s.placed) continue;
+      if (!anchor)
+        anchor = &s;
+      else if (s.placement.first != anchor->placement.first ||
+               s.placement.ranks != anchor->placement.ranks)
+        return false;
+    }
+    return true;
+  }
 
   void sync() override {
     runtime_->issue_execution_fence(ctx_).get_void_result();
@@ -558,6 +594,11 @@ class LegionBackend final : public DpuBackend {
   }
 
  private:
+  struct Prefetch {
+    Future done;
+    std::vector<char> data;
+  };
+
   struct Storage {
     // Per-DPU vectors: created when placed.
     LogicalRegion region = LogicalRegion::NO_REGION;
@@ -570,7 +611,27 @@ class LegionBackend final : public DpuBackend {
     Placement placement{};
     // Partitions by rank count.
     std::map<uint32_t, LogicalPartition> partitions;
+    // Per-DPU vectors: a read started when last written (see launch).
+    std::shared_ptr<Prefetch> prefetch;
   };
+
+  // Replaces `s`'s prefetch; an older one in flight is kept until it lands.
+  void prefetch(Storage& s) {
+    retire_prefetch(s);
+    auto p = std::make_shared<Prefetch>();
+    p->data.resize(s.region_elements * s.element_size);
+    HostCopy copy{p->data.data(), p->data.size(), s.element_size};
+    TaskLauncher launcher(READ_TASK_ID, TaskArgument(&copy, sizeof(copy)));
+    launcher.add_region_requirement(RegionRequirement(
+        s.region, LEGION_READ_ONLY, LEGION_EXCLUSIVE, s.region));
+    launcher.add_field(0, FID_DATA);
+    p->done = runtime_->execute_task(ctx_, launcher);
+    s.prefetch = std::move(p);
+  }
+
+  void retire_prefetch(Storage& s) {
+    if (s.prefetch) retired_.push_back(std::move(s.prefetch));
+  }
 
   LogicalRegion make_region(size_t elements, size_t element_size) {
     IndexSpace is = runtime_->create_index_space(
@@ -687,6 +748,10 @@ class LegionBackend final : public DpuBackend {
       inflight_.front().first.get_void_result();
       inflight_.pop_front();
     }
+    while (!retired_.empty() && (all || retired_.front()->done.is_ready())) {
+      retired_.front()->done.get_void_result();
+      retired_.pop_front();
+    }
   }
 
   Runtime* runtime_ = nullptr;
@@ -701,6 +766,7 @@ class LegionBackend final : public DpuBackend {
   std::mutex mtx_;
   std::map<const detail::VectorDesc*, Storage> storage_;
   std::deque<std::pair<Future, std::unique_ptr<Launch>>> inflight_;
+  std::deque<std::shared_ptr<Prefetch>> retired_;  // replaced, maybe in flight
 };
 
 }  // namespace
