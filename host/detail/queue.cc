@@ -694,6 +694,8 @@ void EventQueue::await_queue_space() {
     // process_next needs the mutex; we hold it recursively via submit.
     mtx_.unlock();
     process_next();
+    // Retire finished events too, or a full queue of them never drains.
+    finalize_finished_events();
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     mtx_.lock();
   }
