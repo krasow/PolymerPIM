@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -27,6 +28,7 @@
 #include <stdexcept>
 
 #include "backend.h"
+#include "default_mapper.h"
 #include "realm/upmem/upmem_api.h"
 #include "realm/upmem/upmem_internal.h"
 #include "realm/upmem/upmem_layout.h"
@@ -210,6 +212,41 @@ class LegionShard final : public DpuBackend::Shard {
   std::vector<Piece> pieces_;
 };
 
+// A DPU reads only its own MRAM, and nothing moves data between DPUs of a
+// rank, so every sharded operand must give each DPU the same elements.
+// Mismatched shards would compute on unrelated elements, so stop instead.
+//
+// TODO: intra-rank copies.  Legion sees one memory per rank, so it never moves
+// data between DPUs of a rank, and upmem-legion registers no MRAM-to-MRAM
+// channel (XFER_DPU_IN_MRAM is never instantiated).  A host-bounce channel
+// batched across the rank would let Legion realign shards instead of this
+// abort, and is the base for ops that exchange data between DPUs (shifts,
+// gather/scatter, scans, broadcasts): either as per-DPU Legion memories or as
+// explicit exchange ops here.
+void check_aligned(const Launch& launch, const LegionShard& shard) {
+  const Operand* ref = nullptr;
+  for (const Operand& op : launch.operands) {
+    if (op.per_dpu) continue;
+    if (!ref) {
+      ref = &op;
+      continue;
+    }
+    const uint32_t ref_count = shard.size_bytes(*ref->vec) / ref->element_size;
+    const uint32_t count = shard.size_bytes(*op.vec) / op.element_size;
+    if (count == ref_count &&
+        (count == 0 ||
+         shard.first_element(*op.vec) == shard.first_element(*ref->vec)))
+      continue;
+    std::fprintf(stderr,
+                 "polymerpim: DPU %u holds elements [%u, +%u) of one kernel "
+                 "operand but [%u, +%u) of another; shards within a rank are "
+                 "misaligned\n",
+                 shard.dpu(), shard.first_element(*ref->vec), ref_count,
+                 shard.first_element(*op.vec), count);
+    std::abort();
+  }
+}
+
 // Runs on a rank's processor: fills its DPUs' arguments and starts the
 // kernel.  The task completes when the rank's stream drains.
 int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
@@ -225,6 +262,7 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   std::vector<DPU_LAUNCH_ARGS> args(nr);
   for (uint32_t d = 0; d < nr; d++) {
     shard.at(d);
+    check_aligned(launch, shard);
     launch.fill(args[d], shard);
   }
   if (launch.inspect) launch.inspect(args.data(), nr);
@@ -501,9 +539,12 @@ class LegionBackend final : public DpuBackend {
     IndexLauncher launcher(KERNEL_TASK_ID, colors_,
                            TaskArgument(&raw, sizeof(raw)), ArgumentMap());
     for (size_t i = 0; i < regions.size(); i++) {
+      // Exact instances: a shard's elements depend on its instance's bounds
+      // (see check_aligned), so a larger instance must not be reused.
       launcher.add_region_requirement(RegionRequirement(
           regions[i]->partition, 0, pending->operands[i].privilege,
-          LEGION_EXCLUSIVE, regions[i]->region));
+          LEGION_EXCLUSIVE, regions[i]->region,
+          Mapping::DefaultMapper::EXACT_REGION));
       launcher.add_field((unsigned)i, FID_DATA);
     }
     Future done =
