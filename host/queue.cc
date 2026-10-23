@@ -130,7 +130,7 @@ void EventQueue::process_events(size_t wait_for_id) {
         << "dpu_sync wait_for_id=" << wait_for_id
         << " last_finished=" << this->get_last_finished_id() << std::endl;
 #endif
-    DpuRuntime::get().backend().sync();
+    DpuRuntime::get().backend().progress();
     finalize_finished_events();
 #if ENABLE_DPU_LOGGING >= 2
     logger.lock(logcat::QUEUE_WAIT, 2)

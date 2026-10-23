@@ -44,8 +44,7 @@ void vec_xfer_from_dpu_strided(char* cpu, VectorDescRef desc, size_t stride) {
   DpuRuntime::get().backend().read(desc, cpu, stride);
 }
 
-// The argument callbacks below capture by value: a backend may run them after
-// launch() returns, once it knows where each shard landed.
+// Callbacks capture by value: a backend may run them after launch() returns.
 
 namespace {
 DpuBackend::InspectArgs log_launch_args() {
@@ -149,8 +148,7 @@ void internal_launch_universal_pipeline(
                              "); rebuild with JIT=1 or raise MAX_VFUSE_OPS");
 #endif
 
-  // Extra outputs -- horizontally fused results and local vectors, whose
-  // accumulators start from the identity -- are written in full.
+  // Extra outputs (hfused results, identity-seeded locals) are fully written.
   std::vector<VectorDescRef> reads = {init};
   reads.insert(reads.end(), operands.begin(), operands.end());
   std::vector<VectorDescRef> writes = {res};

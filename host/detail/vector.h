@@ -132,8 +132,7 @@ class dpu_vector {
   // transfer is queued, so the buffer must outlive it -- add_fence() first.
   static dpu_vector<T> from_cpu(T* cpu_data, size_t n,
                                 LOGGER_ARGS_WITH_DEFAULTS);
-  // `n_per_dpu` elements on every DPU, read back in DPU order: storage for
-  // per-DPU results such as reduction partials.
+  // `n_per_dpu` elements per DPU, read back in DPU order (e.g. partials).
   static dpu_vector<T> per_dpu(size_t n_per_dpu, uint32_t reserved = 0,
                                bool lazy = false, LOGGER_ARGS_WITH_DEFAULTS);
   void add_fence();
