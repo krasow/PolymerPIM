@@ -23,12 +23,6 @@
 
 #include "vector.h"
 
-#ifndef DPURT
-#define DPURT
-#include <dpu>  // UPMEM rt syslib
-#define CHECK_UPMEM(x) DPU_ASSERT(x)
-#endif
-
 namespace fs = std::filesystem;
 
 namespace detail {
@@ -359,65 +353,38 @@ void log_oom_requeued(const std::shared_ptr<Event>& e) {
 // The EventQueue members below are the mechanics those helpers serve.
 using namespace detail;
 
-/*static*/ dpu_error_t upmem_callback([[maybe_unused]] struct dpu_set_t stream,
-                                      [[maybe_unused]] uint32_t rank_id,
-                                      void* data) {
-  auto self_ptr = static_cast<std::shared_ptr<Event>*>(data);
-  std::shared_ptr<Event> me = *self_ptr;
+// Marks `me` finished once everything issued before it completes.
+static void finish_when_drained(std::shared_ptr<Event> me) {
+  auto& queue = DpuRuntime::get().get_event_queue();
+  queue.outstanding_callbacks_++;
 
-  auto& runtime = DpuRuntime::get();
-  auto& queue = runtime.get_event_queue();
-  std::recursive_mutex& mtx = queue.get_mutex();
+  DpuRuntime::get().backend().notify([me = std::move(me)]() {
+    auto& queue = DpuRuntime::get().get_event_queue();
+    {
+      std::lock_guard<std::recursive_mutex> lock(queue.get_mutex());
+      me->mark_finished();
+    }
 
-  {
-    std::lock_guard<std::recursive_mutex> lock(mtx);
-    me->mark_finished();
-  }
-
-  static std::atomic<size_t> callback_count{0};
-  size_t count = ++callback_count;
-  if (count % 100 == 0) {
+    static std::atomic<size_t> callback_count{0};
+    size_t count = ++callback_count;
+    if (count % 100 == 0) {
 #if ENABLE_DPU_LOGGING >= 1
-    Logger& logger = DpuRuntime::get().get_logger();
-    logger.lock(logcat::QUEUE_HEARTBEAT, 2)
-        << "callback fired (" << count << ") for id=" << me->id << std::endl;
+      Logger& logger = DpuRuntime::get().get_logger();
+      logger.lock(logcat::QUEUE_HEARTBEAT, 2)
+          << "callback fired (" << count << ") for id=" << me->id << std::endl;
 #endif
-  }
+    }
 
-  delete self_ptr;
-  queue.outstanding_callbacks_--;
-
-  return DPU_OK;
+    queue.outstanding_callbacks_--;
+  });
 }
 void Event::add_completion_callback(std::shared_ptr<Event> self) {
   assert(this->finished == false);
-
-  auto& runtime = DpuRuntime::get();
-  auto& queue = runtime.get_event_queue();
-  dpu_set_t& dpu_set = runtime.dpu_set();
-
-  queue.outstanding_callbacks_++;
-  auto wrapper = new std::shared_ptr<Event>(self);
-
-  CHECK_UPMEM(dpu_callback(
-      dpu_set, &upmem_callback, (void*)wrapper,
-      (dpu_callback_flags_t)(DPU_CALLBACK_ASYNC | DPU_CALLBACK_NONBLOCKING |
-                             DPU_CALLBACK_SINGLE_CALL)));
+  finish_when_drained(std::move(self));
 }
 void EventQueue::add_fence(std::shared_ptr<Event> e) {
   assert(e->finished == false);
-
-  auto& runtime = DpuRuntime::get();
-  auto& queue = runtime.get_event_queue();
-  dpu_set_t& dpu_set = runtime.dpu_set();
-
-  queue.outstanding_callbacks_++;
-  auto wrapper = new std::shared_ptr<Event>(std::move(e));
-
-  CHECK_UPMEM(dpu_callback(
-      dpu_set, &upmem_callback, (void*)wrapper,
-      (dpu_callback_flags_t)(DPU_CALLBACK_ASYNC | DPU_CALLBACK_NONBLOCKING |
-                             DPU_CALLBACK_SINGLE_CALL)));
+  finish_when_drained(std::move(e));
 }
 void EventQueue::finalize_finished_events() {
   std::lock_guard<std::recursive_mutex> lock(mtx_);
@@ -590,7 +557,7 @@ void EventQueue::switch_dpu_binary(const std::shared_ptr<Event>& e) {
   log_binary_switch(current_binary_path_, required);
   trace::jit_binary_switch(current_binary_path_, required);
 
-  // dpu_load replaces the code on every DPU, so nothing else may be in flight.
+  // A load replaces the code on every DPU, so nothing else may be in flight.
   while (true) {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     if (running_events_.size() <= 1 &&
@@ -600,7 +567,7 @@ void EventQueue::switch_dpu_binary(const std::shared_ptr<Event>& e) {
   }
 
   VECTORDPU_NOTE(binary_switches);
-  DPU_ASSERT(dpu_load(DpuRuntime::get().dpu_set(), required.c_str(), nullptr));
+  DpuRuntime::get().backend().load(required);
   current_binary_path_ = required;
   log_binary_loaded();
 }
@@ -653,8 +620,8 @@ void EventQueue::requeue_after_oom(const std::shared_ptr<Event>& e) {
   }
 
   log_oom_freeing(e);
-  auto& alloc = DpuRuntime::get().get_allocator();
-  for (auto& out : outputs_to_free) alloc.deallocate_upmem_vector(out.get());
+  auto& backend = DpuRuntime::get().backend();
+  for (auto& out : outputs_to_free) backend.release(*out);
 
   {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
@@ -726,6 +693,8 @@ void EventQueue::await_queue_space() {
     // process_next needs the mutex; we hold it recursively via submit.
     mtx_.unlock();
     process_next();
+    // Retire finished events too, or a full queue of them never drains.
+    finalize_finished_events();
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     mtx_.lock();
   }

@@ -1,11 +1,9 @@
 #pragma once
 #include <memory>
 
-#include "allocator.h"
+#include "backend.h"
 #include "logger.h"
 #include "queue.h"
-
-struct dpu_set_t;
 
 class DpuRuntime {
  private:
@@ -13,9 +11,8 @@ class DpuRuntime {
   ~DpuRuntime() = default;
 
   bool initialized_;
-  dpu_set_t* dpu_set_;
+  std::unique_ptr<DpuBackend> backend_;
   uint32_t num_dpus_;
-  std::unique_ptr<allocator> allocator_;
   std::unique_ptr<EventQueue> event_queue_;
   std::unique_ptr<Logger> logger_;
 
@@ -39,10 +36,9 @@ class DpuRuntime {
 
   void debug_read_dpu_log();
 
-  allocator& get_allocator();
   EventQueue& get_event_queue();
   Logger& get_logger();
-  dpu_set_t& dpu_set();
+  DpuBackend& backend();
   uint32_t num_dpus() const;
   uint32_t num_tasklets() const;
 
