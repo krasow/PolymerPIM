@@ -4,16 +4,13 @@
 #include "mapper.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "default_mapper.h"
 
 namespace polymerpim_legion {
-namespace {
-
-using namespace Legion;
-using namespace Legion::Mapping;
 
 size_t rank_bytes() {
   if (const char* value = std::getenv("POLYMERPIM_RANK_BYTES")) {
@@ -22,6 +19,11 @@ size_t rank_bytes() {
   }
   return size_t{32} << 20;
 }
+
+namespace {
+
+using namespace Legion;
+using namespace Legion::Mapping;
 
 class PolymerPIMMapper final : public DefaultMapper {
  public:
@@ -48,6 +50,36 @@ class PolymerPIMMapper final : public DefaultMapper {
       output.slices.push_back(
           TaskSlice(Domain(Rect<1>(*p, *p)), rank, false, false));
     }
+  }
+
+  // Index copies write a vector's rank pieces: each point's destination goes
+  // in its rank's memory, where the kernels will find it.
+  void map_copy(const MapperContext ctx, const Copy& copy,
+                const MapCopyInput& input, MapCopyOutput& output) override {
+    if (!copy.is_index_space || copy.dst_requirements.size() != 1) {
+      DefaultMapper::map_copy(ctx, copy, input, output);
+      return;
+    }
+    output.src_instances[0] = input.src_instances[0];
+    const uint64_t first = copy.tag >> PLACEMENT_TAG_SHIFT;
+    const Processor rank =
+        ranks_[(first + copy.index_point[0]) % ranks_.size()];
+    const RegionRequirement& req = copy.dst_requirements[0];
+    const Memory target = default_policy_select_target_memory(ctx, rank, req);
+    bool force_new = false;
+    LayoutConstraintSet constraints = runtime->find_layout_constraints(
+        ctx, default_policy_select_layout_constraints(
+                 ctx, target, req, COPY_MAPPING, true, force_new));
+    constraints.add_constraint(
+        FieldConstraint(req.privilege_fields, false, false));
+    PhysicalInstance instance;
+    if (!default_make_instance(ctx, target, constraints, instance, COPY_MAPPING,
+                               force_new, true, req)) {
+      std::fprintf(stderr, "PolymerPIM mapper: no room on rank %u for a copy\n",
+                   (unsigned)(first + copy.index_point[0]));
+      std::abort();
+    }
+    output.dst_instances[0].push_back(instance);
   }
 
   void select_tunable_value(const MapperContext ctx, const Task& task,

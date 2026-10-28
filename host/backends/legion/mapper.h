@@ -8,8 +8,6 @@ namespace polymerpim_legion {
 // Below LEGION_MAX_APPLICATION_TASK_ID.
 enum : Legion::TaskID {
   KERNEL_TASK_ID = 0x504d1,
-  WRITE_TASK_ID,
-  READ_TASK_ID,
   TOP_LEVEL_TASK_ID,
 };
 
@@ -22,9 +20,12 @@ struct Placement {
 // Tunable: bytes of the largest unplaced operand (uint64_t) -> Placement.
 constexpr Legion::TunableID PLACEMENT_TUNABLE = 0x504d;
 
-// Launch point i runs on rank first + i; first rides in the tag, above the
-// default mapper's bits.
+// Launch (or index copy) point i runs on rank first + i; first rides in the
+// tag, above the default mapper's bits.
 constexpr unsigned PLACEMENT_TAG_SHIFT = 8;
+
+// Bytes per rank a placement allows ($POLYMERPIM_RANK_BYTES, 32 MiB).
+size_t rank_bytes();
 
 // Installs the mapper on every processor; call before Runtime::start.
 void register_mapper();
