@@ -260,33 +260,6 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   return 0;
 }
 
-// Copies `bytes` from the start of a (possibly padded) region.
-struct HostCopy {
-  void* host;
-  size_t bytes;
-  size_t element_size;
-};
-
-void write_task(const Task* task, const std::vector<PhysicalRegion>& regions,
-                Context, Runtime*) {
-  const HostCopy& copy = *static_cast<const HostCopy*>(task->args);
-  const Rect<1> rect = regions[0].get_bounds<1, coord_t>().bounds;
-  FieldAccessor<LEGION_WRITE_DISCARD, uint8_t, 1, coord_t,
-                Realm::AffineAccessor<uint8_t, 1, coord_t>>
-      acc(regions[0], FID_DATA, copy.element_size);
-  std::memcpy(acc.ptr(rect.lo), copy.host, copy.bytes);
-}
-
-void read_task(const Task* task, const std::vector<PhysicalRegion>& regions,
-               Context, Runtime*) {
-  const HostCopy& copy = *static_cast<const HostCopy*>(task->args);
-  const Rect<1> rect = regions[0].get_bounds<1, coord_t>().bounds;
-  FieldAccessor<LEGION_READ_ONLY, uint8_t, 1, coord_t,
-                Realm::AffineAccessor<uint8_t, 1, coord_t>>
-      acc(regions[0], FID_DATA, copy.element_size);
-  std::memcpy(copy.host, acc.ptr(rect.lo), copy.bytes);
-}
-
 void register_tasks() {
   register_mapper();
   {
@@ -295,19 +268,6 @@ void register_tasks() {
     registrar.set_leaf();
     Runtime::preregister_task_variant<int, kernel_task>(registrar,
                                                         "polymerpim_kernel");
-  }
-  {
-    TaskVariantRegistrar registrar(WRITE_TASK_ID, "polymerpim_write");
-    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
-    registrar.set_leaf();
-    Runtime::preregister_task_variant<write_task>(registrar,
-                                                  "polymerpim_write");
-  }
-  {
-    TaskVariantRegistrar registrar(READ_TASK_ID, "polymerpim_read");
-    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
-    registrar.set_leaf();
-    Runtime::preregister_task_variant<read_task>(registrar, "polymerpim_read");
   }
 }
 
@@ -443,17 +403,45 @@ class LegionBackend final : public DpuBackend {
   }
 
   void write(const detail::VectorDescRef& vec, const char* host) override {
-    const Storage& s = storage_of(*vec);
+    Storage& s = storage_of(*vec);
     if (s.per_dpu)
       throw std::logic_error("per-DPU vectors are written only by kernels");
-    // Waited on so the caller may free `host` once the event retires.
-    HostCopy copy{const_cast<char*>(host), vec->num_elements * s.element_size,
-                  s.element_size};
-    TaskLauncher launcher(WRITE_TASK_ID, TaskArgument(&copy, sizeof(copy)));
-    launcher.add_region_requirement(RegionRequirement(
-        s.region, LEGION_WRITE_DISCARD, LEGION_EXCLUSIVE, s.region));
-    launcher.add_field(0, FID_DATA);
-    runtime_->execute_task(ctx_, launcher).get_void_result();
+    const size_t n = vec->num_elements;
+    if (n == 0) return;
+    // A vector this size spans every rank wherever it is used, so placing it
+    // now copies it straight there; smaller ones wait for their first kernel
+    // and are staged in sysmem.
+    if (!s.placed &&
+        n * s.element_size >= (uint64_t)num_ranks_ * rank_bytes()) {
+      Operand op{vec.get(), LEGION_READ_ONLY, s.element_size, false, 0};
+      place({op}, {&s});
+    }
+    // Copies cover the intersection, so the padding is left as is.
+    const Attached src = attach(s, const_cast<char*>(host), n);
+    const RegionRequirement from(src.region, LEGION_READ_ONLY, LEGION_EXCLUSIVE,
+                                 src.region);
+    if (s.placed) {
+      IndexCopyLauncher copy(colors(s.placement.ranks));
+      copy.tag = (MappingTagID)s.placement.first << PLACEMENT_TAG_SHIFT;
+      copy.add_copy_requirements(
+          from,
+          RegionRequirement(partition(s, s.placement.ranks), 0,
+                            LEGION_WRITE_DISCARD, LEGION_EXCLUSIVE, s.region,
+                            Mapping::DefaultMapper::EXACT_REGION));
+      copy.add_src_field(0, FID_DATA);
+      copy.add_dst_field(0, FID_DATA);
+      runtime_->issue_copy_operation(ctx_, copy);
+    } else {
+      CopyLauncher copy;
+      copy.add_copy_requirements(
+          from, RegionRequirement(s.region, LEGION_WRITE_DISCARD,
+                                  LEGION_EXCLUSIVE, s.region));
+      copy.add_src_field(0, FID_DATA);
+      copy.add_dst_field(0, FID_DATA);
+      runtime_->issue_copy_operation(ctx_, copy);
+    }
+    // The caller may free `host` once this returns.
+    detach(src).get_void_result();
   }
 
   // A per-DPU vector spans the ranks of the kernel that writes it.
@@ -483,7 +471,7 @@ class LegionBackend final : public DpuBackend {
 
   void read(const detail::VectorDescRef& vec, char* host,
             size_t stride) override {
-    const Storage& s = storage_of(*vec);
+    Storage& s = storage_of(*vec);
     if (!s.per_dpu) {
       read_region(s, host, vec->num_elements * s.element_size);
       return;
@@ -611,6 +599,8 @@ class LegionBackend final : public DpuBackend {
     Placement placement{};
     // Partitions by rank count.
     std::map<uint32_t, LogicalPartition> partitions;
+    // The unpadded elements, for host reads.
+    LogicalRegion prefix = LogicalRegion::NO_REGION;
     // Per-DPU vectors: a read started when last written (see launch).
     std::shared_ptr<Prefetch> prefetch;
   };
@@ -620,12 +610,7 @@ class LegionBackend final : public DpuBackend {
     retire_prefetch(s);
     auto p = std::make_shared<Prefetch>();
     p->data.resize(s.region_elements * s.element_size);
-    HostCopy copy{p->data.data(), p->data.size(), s.element_size};
-    TaskLauncher launcher(READ_TASK_ID, TaskArgument(&copy, sizeof(copy)));
-    launcher.add_region_requirement(RegionRequirement(
-        s.region, LEGION_READ_ONLY, LEGION_EXCLUSIVE, s.region));
-    launcher.add_field(0, FID_DATA);
-    p->done = runtime_->execute_task(ctx_, launcher);
+    p->done = copy_out(s, p->data.data(), p->data.size());
     s.prefetch = std::move(p);
   }
 
@@ -731,13 +716,67 @@ class LegionBackend final : public DpuBackend {
     return it->second;
   }
 
-  void read_region(const Storage& s, char* host, size_t bytes) {
-    HostCopy copy{host, bytes, s.element_size};
-    TaskLauncher launcher(READ_TASK_ID, TaskArgument(&copy, sizeof(copy)));
-    launcher.add_region_requirement(RegionRequirement(
-        s.region, LEGION_READ_ONLY, LEGION_EXCLUSIVE, s.region));
-    launcher.add_field(0, FID_DATA);
-    runtime_->execute_task(ctx_, launcher).get_void_result();
+  void read_region(Storage& s, char* host, size_t bytes) {
+    if (bytes) copy_out(s, host, bytes).get_void_result();
+  }
+
+  // Copies the first `bytes` of `s` into `host`; done when the returned
+  // future is.
+  Future copy_out(Storage& s, char* host, size_t bytes) {
+    const size_t n = bytes / s.element_size;
+    const Attached dst = attach(s, host, n);
+    CopyLauncher copy;
+    copy.add_copy_requirements(
+        RegionRequirement(prefix(s, n), LEGION_READ_ONLY, LEGION_EXCLUSIVE,
+                          s.region),
+        RegionRequirement(dst.region, LEGION_WRITE_DISCARD, LEGION_EXCLUSIVE,
+                          dst.region));
+    copy.add_src_field(0, FID_DATA);
+    copy.add_dst_field(0, FID_DATA);
+    runtime_->issue_copy_operation(ctx_, copy);
+    return detach(dst);
+  }
+
+  // A region over `n` elements of `host`, so the DPU channels copy to and from
+  // it directly.
+  struct Attached {
+    IndexSpace space;
+    LogicalRegion region;
+    PhysicalRegion instance;
+  };
+
+  Attached attach(const Storage& s, char* host, size_t n) {
+    Attached a;
+    a.space = runtime_->create_index_space(ctx_, Rect<1>(0, (coord_t)n - 1));
+    a.region = runtime_->create_logical_region(ctx_, a.space,
+                                               s.region.get_field_space());
+    AttachLauncher launcher(LEGION_EXTERNAL_INSTANCE, a.region, a.region, true,
+                            false);
+    launcher.attach_array_soa(host, true, {FID_DATA});
+    a.instance = runtime_->attach_external_resource(ctx_, launcher);
+    return a;
+  }
+
+  Future detach(const Attached& a) {
+    Future done = runtime_->detach_external_resource(ctx_, a.instance);
+    runtime_->destroy_logical_region(ctx_, a.region);
+    runtime_->destroy_index_space(ctx_, a.space);
+    return done;
+  }
+
+  // `s`'s first `n` elements; the region is padded to whole rows.
+  LogicalRegion prefix(Storage& s, size_t n) {
+    if (n == s.region_elements) return s.region;
+    if (!s.prefix.exists()) {
+      std::map<DomainPoint, Domain> piece{
+          {DomainPoint(Point<1>(0)), Domain(Rect<1>(0, (coord_t)n - 1))}};
+      IndexPartition ip = runtime_->create_partition_by_domain(
+          ctx_, s.region.get_index_space(), piece, colors(1));
+      s.prefix = runtime_->get_logical_subregion_by_color(
+          ctx_, runtime_->get_logical_partition(ctx_, s.region, ip),
+          DomainPoint(Point<1>(0)));
+    }
+    return s.prefix;
   }
 
   // Frees finished launches on the context's thread: their callbacks hold
