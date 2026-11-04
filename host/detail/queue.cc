@@ -572,6 +572,7 @@ void EventQueue::switch_dpu_binary(const std::shared_ptr<Event>& e) {
   log_binary_loaded();
 }
 void EventQueue::dispatch(const std::shared_ptr<Event>& e) {
+  trace::dispatch_scope trace_dispatch(e);
   log_dispatch(e, "begin");
   switch (e->op) {
     case Event::OperationType::FENCE:

@@ -18,6 +18,7 @@
 #include "backend.h"
 #include "default_mapper.h"
 #include "mapper.h"
+#include "perfetto/detail/trace.h"
 #include "realm/upmem/upmem_api.h"
 #include "realm/upmem/upmem_internal.h"
 #include "realm/upmem/upmem_layout.h"
@@ -86,6 +87,7 @@ struct Launch {
   std::string binary;
   // Per point; kept until the launch is reaped since the push is async.
   std::vector<std::vector<DPU_LAUNCH_ARGS>> args;
+  trace::LaunchTag trace;
 };
 
 // Binary loaded on each rank; changed only by that rank's kernel task.
@@ -102,7 +104,9 @@ void ensure_binary(RankDPU& rank, dpu_set_t* stream,
   }
   // Earlier kernels must finish on their own binary.
   CHECK_UPMEM(dpu_sync(*stream));
+  trace::rank_span_begin(rank_index(&rank), "load binary");
   CHECK_UPMEM(dpu_load(*stream, binary.c_str(), nullptr));
+  trace::rank_span_end(rank_index(&rank));
   std::lock_guard<std::mutex> lock(resident_mutex);
   resident[&rank] = binary;
 }
@@ -256,7 +260,10 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   // Async: a sync transfer behind pending async work can crash the SDK.
   CHECK_UPMEM(dpu_push_xfer(*stream, DPU_XFER_TO_DPU, "args", 0,
                             sizeof(DPU_LAUNCH_ARGS), DPU_XFER_ASYNC));
+  trace::rank_launch_begin(*stream, rank_index(rank), 1, launch.trace,
+                           task->index_point[0] == 0);
   CHECK_UPMEM(dpu_launch(*stream, DPU_ASYNCHRONOUS));
+  trace::rank_launch_end(*stream, rank_index(rank));
   return 0;
 }
 
@@ -324,6 +331,7 @@ class LegionBackend final : public DpuBackend {
             "DPUs");
     num_ranks_ = (uint32_t)ranks.size();
     num_dpus_ = num_ranks_ * dpus_per_rank_;
+    trace::set_concurrent_ranks();
 
     load(binary);
     open_ = true;
@@ -501,7 +509,8 @@ class LegionBackend final : public DpuBackend {
               const std::vector<detail::VectorDescRef>& writes,
               const FillArgs& fill, const InspectArgs& inspect) override {
     reap(false);
-    auto pending = std::make_unique<Launch>(Launch{fill, inspect, {}, binary_});
+    auto pending = std::make_unique<Launch>(
+        Launch{fill, inspect, {}, binary_, {}, trace::current_launch()});
     std::vector<Storage*> regions;
     auto add = [&](const detail::VectorDescRef& vec, PrivilegeMode privilege) {
       if (!vec) return;
