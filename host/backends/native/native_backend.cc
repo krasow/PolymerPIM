@@ -171,10 +171,10 @@ class NativeBackend final : public DpuBackend {
       CHECK_UPMEM(dpu_push_xfer(set_, DPU_XFER_TO_DPU, "args", 0,
                                 sizeof(args[0]), DPU_XFER_DEFAULT));
     }
-    trace::rank_launch_begin(set_, 0, nr_ranks_, trace::current_launch(),
-                             true);
+    void* traced = trace::rank_launch_begin(set_, 0, nr_ranks_,
+                                            trace::current_launch(), true);
     CHECK_UPMEM(dpu_launch(set_, DPU_ASYNCHRONOUS));
-    trace::rank_launch_end(set_, 0);
+    trace::rank_launch_end(set_, traced);
   }
 
   void notify(std::function<void()> done) override {

@@ -87,7 +87,13 @@ struct Launch {
   std::string binary;
   // Per point; kept until the launch is reaped since the push is async.
   std::vector<std::vector<DPU_LAUNCH_ARGS>> args;
-  trace::LaunchTag trace;
+  // Names the kernels in traces; the last point to start drops it, so its
+  // event ends with them rather than when the launch is reaped.
+  struct Traced {
+    trace::LaunchTag tag;
+    std::atomic<uint32_t> points;
+  };
+  std::unique_ptr<Traced> traced;
 };
 
 // Binary loaded on each rank; changed only by that rank's kernel task.
@@ -260,10 +266,15 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   // Async: a sync transfer behind pending async work can crash the SDK.
   CHECK_UPMEM(dpu_push_xfer(*stream, DPU_XFER_TO_DPU, "args", 0,
                             sizeof(DPU_LAUNCH_ARGS), DPU_XFER_ASYNC));
-  trace::rank_launch_begin(*stream, rank_index(rank), 1, launch.trace,
-                           task->index_point[0] == 0);
+  void* traced = nullptr;
+  if (launch.traced) {
+    traced = trace::rank_launch_begin(*stream, rank_index(rank), 1,
+                                      launch.traced->tag,
+                                      task->index_point[0] == 0);
+    if (--launch.traced->points == 0) launch.traced->tag.reset();
+  }
   CHECK_UPMEM(dpu_launch(*stream, DPU_ASYNCHRONOUS));
-  trace::rank_launch_end(*stream, rank_index(rank));
+  trace::rank_launch_end(*stream, traced);
   return 0;
 }
 
@@ -510,7 +521,7 @@ class LegionBackend final : public DpuBackend {
               const FillArgs& fill, const InspectArgs& inspect) override {
     reap(false);
     auto pending = std::make_unique<Launch>(
-        Launch{fill, inspect, {}, binary_, {}, trace::current_launch()});
+        Launch{fill, inspect, {}, binary_, {}, nullptr});
     std::vector<Storage*> regions;
     auto add = [&](const detail::VectorDescRef& vec, PrivilegeMode privilege) {
       if (!vec) return;
@@ -530,6 +541,9 @@ class LegionBackend final : public DpuBackend {
 
     const Placement placement = place(pending->operands, regions);
     pending->args.resize(placement.ranks);
+    if (trace::LaunchTag tag = trace::current_launch())
+      pending->traced.reset(
+          new Launch::Traced{std::move(tag), {placement.ranks}});
 
     Launch* raw = pending.get();
     IndexLauncher launcher(KERNEL_TASK_ID, colors(placement.ranks),

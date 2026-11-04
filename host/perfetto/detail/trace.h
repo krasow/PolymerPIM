@@ -47,11 +47,12 @@ void dispatch_end();
 // What a launch issued now runs for; null when not tracing.
 LaunchTag current_launch();
 // Queue on `set` (ranks first_rank.. of the system) the start and end of the
-// kernel launched between them, on each rank's track.  `flow` links it to its
-// queue event.  Call with the ranks' xfer lock held.
-void rank_launch_begin(dpu_set_t set, uint32_t first_rank, uint32_t nr_ranks,
-                       LaunchTag tag, bool flow);
-void rank_launch_end(dpu_set_t set, uint32_t first_rank);
+// kernel launched between them, on each rank's track; the event runs until
+// every end fires.  `flow` links it to its queue event.  Call with the ranks'
+// xfer lock held, passing begin's result to end.
+void* rank_launch_begin(dpu_set_t set, uint32_t first_rank, uint32_t nr_ranks,
+                        LaunchTag tag, bool flow);
+void rank_launch_end(dpu_set_t set, void* launch);
 // A host-side step on one rank's track, e.g. loading a binary.
 void rank_span_begin(uint32_t rank, const char* name);
 void rank_span_end(uint32_t rank);
@@ -78,17 +79,18 @@ inline void set_concurrent_ranks() {}
 inline void dispatch_begin(const std::shared_ptr<Event>& e) { (void)e; }
 inline void dispatch_end() {}
 inline LaunchTag current_launch() { return nullptr; }
-inline void rank_launch_begin(dpu_set_t set, uint32_t first_rank,
-                              uint32_t nr_ranks, LaunchTag tag, bool flow) {
+inline void* rank_launch_begin(dpu_set_t set, uint32_t first_rank,
+                               uint32_t nr_ranks, LaunchTag tag, bool flow) {
   (void)set;
   (void)first_rank;
   (void)nr_ranks;
   (void)tag;
   (void)flow;
+  return nullptr;
 }
-inline void rank_launch_end(dpu_set_t set, uint32_t first_rank) {
+inline void rank_launch_end(dpu_set_t set, void* launch) {
   (void)set;
-  (void)first_rank;
+  (void)launch;
 }
 inline void rank_span_begin(uint32_t rank, const char* name) {
   (void)rank;

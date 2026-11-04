@@ -978,9 +978,16 @@ void set_concurrent_ranks() {
 
 void dispatch_begin(const std::shared_ptr<Event>& e) {
   if (!enabled()) return;
-  auto info = std::make_shared<LaunchInfo>();
+  // The event runs until its last launch finishes on its last rank, when the
+  // final reference to its tag drops.
+  auto info = std::shared_ptr<LaunchInfo>(new LaunchInfo, [](LaunchInfo* p) {
+    TRACE_EVENT_END("events", perfetto::Track(EVENT_TRACK_BASE + p->id));
+    delete p;
+  });
   info->id = e->id;
   if (!e->slice_name.empty()) info->name = trace_string(e->slice_name, 256);
+  TRACE_EVENT_BEGIN("events", perfetto::DynamicString("Running: " + info->name),
+                    perfetto::Track(EVENT_TRACK_BASE + e->id), "id", e->id);
   dispatching_ = std::move(info);
   if (concurrent_ranks_) begin_on_dpu_track(e);
 }
@@ -1025,7 +1032,7 @@ static perfetto::Track rank_track(uint32_t rank) {
 static std::atomic<int64_t> busy_ranks_{0};
 
 namespace {
-// Shared by the ranks of one launch; the last to start frees it.
+// Shared by the ranks of one launch; the last callback frees it.
 struct RankLaunch {
   LaunchTag tag;
   uint32_t first_rank;
@@ -1049,9 +1056,10 @@ static dpu_error_t on_rank_begin(dpu_set_t, uint32_t rank_id, void* arg) {
 }
 
 static dpu_error_t on_rank_end(dpu_set_t, uint32_t rank_id, void* arg) {
-  const uint32_t first_rank = (uint32_t)(uintptr_t)arg;
-  TRACE_EVENT_END("events", rank_track(first_rank + rank_id));
+  auto* launch = static_cast<RankLaunch*>(arg);
+  TRACE_EVENT_END("events", rank_track(launch->first_rank + rank_id));
   TRACE_COUNTER("events", "Busy ranks", --busy_ranks_);
+  if (--launch->left == 0) delete launch;
   return DPU_OK;
 }
 
@@ -1062,16 +1070,17 @@ static void queue_rank_callback(dpu_set_t set,
   DPU_ASSERT(dpu_callback(set, fn, arg, DPU_CALLBACK_ASYNC));
 }
 
-void rank_launch_begin(dpu_set_t set, uint32_t first_rank, uint32_t nr_ranks,
-                       LaunchTag tag, bool flow) {
-  if (!enabled() || !tag) return;
-  auto* launch = new RankLaunch{std::move(tag), first_rank, flow, {nr_ranks}};
+void* rank_launch_begin(dpu_set_t set, uint32_t first_rank, uint32_t nr_ranks,
+                        LaunchTag tag, bool flow) {
+  if (!enabled() || !tag) return nullptr;
+  auto* launch =
+      new RankLaunch{std::move(tag), first_rank, flow, {2 * nr_ranks}};
   queue_rank_callback(set, on_rank_begin, launch);
+  return launch;
 }
 
-void rank_launch_end(dpu_set_t set, uint32_t first_rank) {
-  if (!enabled()) return;
-  queue_rank_callback(set, on_rank_end, (void*)(uintptr_t)first_rank);
+void rank_launch_end(dpu_set_t set, void* launch) {
+  if (launch) queue_rank_callback(set, on_rank_end, launch);
 }
 
 void rank_span_begin(uint32_t rank, const char* name) {
