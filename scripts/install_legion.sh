@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR="${1:-${ROOT}/opt/upmem-legion}"
 LEGION_REPO="${LEGION_REPO:-git@github.com:PrescienceLab/upmem-legion.git}"
-LEGION_REV="${LEGION_REV:-a6da57041}"
+LEGION_REV="${LEGION_REV:-8d4fec767}"
 
 if [[ -d "${DEST_DIR}/.git" ]]; then
     # Follow the pin when it moves.
