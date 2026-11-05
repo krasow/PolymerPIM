@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -106,10 +107,23 @@ struct from_cpu {
 namespace trace {
 void initialize();
 void shutdown();
+// Records a trace into `path` until stop(); throws if one is recording.
+void start(const std::string& path);
+// Writes the trace start() began and returns its absolute path.
+std::string stop();
 }  // namespace trace
 #define TRACE_INIT() trace::initialize()
 #define TRACE_SHUTDOWN() trace::shutdown()
 #else
+namespace trace {
+[[noreturn]] inline void start(const std::string& path) {
+  (void)path;
+  throw std::runtime_error("libpolymerpim was built with TRACE=0");
+}
+[[noreturn]] inline std::string stop() {
+  throw std::runtime_error("libpolymerpim was built with TRACE=0");
+}
+}  // namespace trace
 #define TRACE_INIT()
 #define TRACE_SHUTDOWN()
 #endif

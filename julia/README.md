@@ -57,6 +57,23 @@ result = @dputime abs2.(a .- 3) .+ b
 
 The first call includes JIT compilation; later calls reuse the kernel.
 
+## Tracing
+
+`@trace` records a Perfetto trace of a block and prints the absolute path it
+wrote; open it at <https://ui.perfetto.dev>. It needs a library built with
+`TRACE=1`.
+
+```julia
+@trace begin
+    c .= a .+ b
+    total = sum(c)
+end
+@trace filename = "add.perfetto-trace" c .= a .+ b
+```
+
+Only one trace records at a time, so `@trace` errors inside another `@trace`
+or while `POLYMERPIM_TRACE` is tracing the whole run.
+
 ## Reductions
 
 `sum`, `prod`, `minimum`, and `maximum` return futures. Leave independent
