@@ -6,12 +6,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR="${1:-${ROOT}/opt/upmem-legion}"
 LEGION_REPO="${LEGION_REPO:-git@github.com:PrescienceLab/upmem-legion.git}"
-LEGION_REV="${LEGION_REV:-456c2499f}"
+LEGION_REV="${LEGION_REV:-7c4ad47dc}"
 
 if [[ -d "${DEST_DIR}/.git" ]]; then
     # Follow the pin when it moves.
     if ! git -C "${DEST_DIR}" cat-file -e "${LEGION_REV}^{commit}" 2>/dev/null; then
-        git -C "${DEST_DIR}" fetch "${LEGION_REPO}"
+        git -C "${DEST_DIR}" fetch "${LEGION_REPO}" "+refs/heads/*:refs/remotes/origin/*"
     fi
     git -C "${DEST_DIR}" checkout --detach "${LEGION_REV}"
     exit 0
