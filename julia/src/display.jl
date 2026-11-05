@@ -73,6 +73,7 @@ function versioninfo(io::IO = stdout)
 
     println(io, "Library:")
     _field(io, "Backend", cfg("BACKEND"))
+    _field(io, "Device runtime", cfg("DEVICE_RUNTIME", "native"))
     _field(io, "Pipeline/JIT", string("PIPELINE=", cfg("PIPELINE"), " JIT=", cfg("JIT"),
                                       " batch=", cfg("JIT_BATCH_SIZE")))
     _field(io, "Build", string(inst("BUILD_TYPE"), ", ", cfg("CXX_STANDARD"),
