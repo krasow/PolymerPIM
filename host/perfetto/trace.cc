@@ -1,12 +1,14 @@
 #include "perfetto/trace.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -168,6 +170,7 @@ PERFETTO_TRACK_EVENT_STATIC_STORAGE();
 
 static std::unique_ptr<perfetto::TracingSession> tracing_session_;
 static bool tracing_enabled_ = false;
+static bool concurrent_ranks_ = false;
 
 static bool truthy_env(const char* value) {
   if (value == nullptr || value[0] == '\0') return false;
@@ -688,12 +691,6 @@ void initialize() {
   tracing_session_->Setup(cfg);
   tracing_session_->StartBlocking();
 
-  auto track_desc = perfetto::Track(DPU_TRACK_ID).Serialize();
-  track_desc.set_name("DPU Hardware");
-  track_desc.set_parent_uuid(perfetto::ProcessTrack::Current().uuid);
-  perfetto::TrackEvent::SetTrackDescriptor(perfetto::Track(DPU_TRACK_ID),
-                                           track_desc);
-
   auto jit_track_desc = perfetto::Track(8080).Serialize();
   jit_track_desc.set_name("JIT Compiler");
   jit_track_desc.set_parent_uuid(perfetto::ProcessTrack::Current().uuid);
@@ -867,8 +864,22 @@ void inqueue_end(std::shared_ptr<Event> e) {
   TRACE_EVENT_END("queue", perfetto::Track(EVENT_TRACK_BASE + e->id));
 }
 
-void execution_begin(std::shared_ptr<Event> e) {
-  if (!enabled()) return;
+// Native retires events in order on "DPU Hardware"; Legion's hand-offs go on
+// "Dispatch".  Each is named on first use so a trace only has its own.
+static perfetto::Track dpu_track() {
+  static std::once_flag named;
+  const uint64_t id = concurrent_ranks_ ? DISPATCH_TRACK_ID : DPU_TRACK_ID;
+  std::call_once(named, [id] {
+    auto desc = perfetto::Track(id).Serialize();
+    desc.set_name(id == DPU_TRACK_ID ? "DPU Hardware" : "Dispatch");
+    desc.set_parent_uuid(perfetto::ProcessTrack::Current().uuid);
+    perfetto::TrackEvent::SetTrackDescriptor(perfetto::Track(id), desc);
+  });
+  return perfetto::Track(id);
+}
+
+// A slice for `e` on the DPU track, flowing from its queue events.
+static void begin_on_dpu_track(const std::shared_ptr<Event>& e) {
   auto base_lambda = [e](perfetto::EventContext& ctx) {
     perfetto::Flow::ProcessScoped(e->id)(ctx);
     for (size_t dep_id : e->dependencies)
@@ -879,7 +890,7 @@ void execution_begin(std::shared_ptr<Event> e) {
     std::string slice_name = trace_string(e->slice_name, 4096);
     std::string ops_summary = summarize_rpn_ops(e->rpn_ops);
     TRACE_EVENT_BEGIN("events", perfetto::DynamicString(slice_name),
-                      perfetto::Track(DPU_TRACK_ID), "id", e->id, "ops_summary",
+                      dpu_track(), "id", e->id, "ops_summary",
                       perfetto::DynamicString(ops_summary),
                       [e, base_lambda](perfetto::EventContext& ctx) {
                         base_lambda(ctx);
@@ -887,7 +898,7 @@ void execution_begin(std::shared_ptr<Event> e) {
                       });
   } else {
     TRACE_EVENT_BEGIN("events", perfetto::DynamicString(e->slice_name),
-                      perfetto::Track(DPU_TRACK_ID), "id", e->id,
+                      dpu_track(), "id", e->id,
                       [e, base_lambda](perfetto::EventContext& ctx) {
                         base_lambda(ctx);
                         add_event_metadata(ctx, e);
@@ -895,9 +906,14 @@ void execution_begin(std::shared_ptr<Event> e) {
   }
 }
 
+void execution_begin(std::shared_ptr<Event> e) {
+  if (!enabled() || concurrent_ranks_) return;
+  begin_on_dpu_track(e);
+}
+
 void execution_end() {
-  if (!enabled()) return;
-  TRACE_EVENT_END("events", perfetto::Track(DPU_TRACK_ID));
+  if (!enabled() || concurrent_ranks_) return;
+  TRACE_EVENT_END("events", dpu_track());
 }
 void active_ops_counter(size_t count) {
   if (!enabled()) return;
@@ -955,6 +971,133 @@ void jit_binary_switch(const std::string& previous,
   TRACE_EVENT_INSTANT("runtime", "binary_switch", perfetto::Track(8080), "from",
                       perfetto::DynamicString(previous), "to",
                       perfetto::DynamicString(current));
+}
+
+static thread_local LaunchTag dispatching_;
+
+void set_concurrent_ranks() {
+  concurrent_ranks_ = true;
+}
+
+void dispatch_begin(const std::shared_ptr<Event>& e) {
+  if (!enabled()) return;
+  // The event runs until its last launch finishes on its last rank, when the
+  // final reference to its tag drops.
+  auto info = std::shared_ptr<LaunchInfo>(new LaunchInfo, [](LaunchInfo* p) {
+    TRACE_EVENT_END("events", perfetto::Track(EVENT_TRACK_BASE + p->id));
+    delete p;
+  });
+  info->id = e->id;
+  if (!e->slice_name.empty()) info->name = trace_string(e->slice_name, 256);
+  TRACE_EVENT_BEGIN("events", perfetto::DynamicString("Running: " + info->name),
+                    perfetto::Track(EVENT_TRACK_BASE + e->id), "id", e->id);
+  dispatching_ = std::move(info);
+  if (concurrent_ranks_) begin_on_dpu_track(e);
+}
+
+void dispatch_end() {
+  if (!enabled()) return;
+  dispatching_.reset();
+  if (concurrent_ranks_)
+    TRACE_EVENT_END("events", dpu_track());
+}
+
+LaunchTag current_launch() {
+  if (!enabled()) return nullptr;
+  static const LaunchTag undispatched = std::make_shared<LaunchInfo>();
+  return dispatching_ ? dispatching_ : undispatched;
+}
+
+static perfetto::Track rank_track(uint32_t rank) {
+  static std::mutex mutex;
+  static std::vector<bool> named;
+  const perfetto::Track parent(RANK_TRACK_BASE);
+  const perfetto::Track track(RANK_TRACK_BASE + 1 + rank, parent);
+  std::lock_guard<std::mutex> lock(mutex);
+  if (named.empty()) {
+    auto desc = parent.Serialize();
+    desc.set_name("DPU Ranks");
+    desc.set_parent_uuid(perfetto::ProcessTrack::Current().uuid);
+    desc.set_child_ordering(perfetto::protos::gen::TrackDescriptor::EXPLICIT);
+    perfetto::TrackEvent::SetTrackDescriptor(parent, desc);
+  }
+  if (named.size() <= rank) named.resize(rank + 1);
+  if (!named[rank]) {
+    auto desc = track.Serialize();
+    desc.set_name("Rank " + std::to_string(rank));
+    desc.set_sibling_order_rank((int32_t)rank);
+    perfetto::TrackEvent::SetTrackDescriptor(track, desc);
+    named[rank] = true;
+  }
+  return track;
+}
+
+static std::atomic<int64_t> busy_ranks_{0};
+
+namespace {
+// Shared by the ranks of one launch; the last callback frees it.
+struct RankLaunch {
+  LaunchTag tag;
+  uint32_t first_rank;
+  bool flow;
+  std::atomic<uint32_t> left;
+};
+}  // namespace
+
+static dpu_error_t on_rank_begin(dpu_set_t, uint32_t rank_id, void* arg) {
+  auto* launch = static_cast<RankLaunch*>(arg);
+  const bool flow = launch->flow && rank_id == 0;
+  const uint64_t id = launch->tag->id;
+  TRACE_EVENT_BEGIN("events", perfetto::DynamicString(launch->tag->name),
+                    rank_track(launch->first_rank + rank_id), "id", id,
+                    [flow, id](perfetto::EventContext& ctx) {
+                      if (flow) perfetto::Flow::ProcessScoped(id)(ctx);
+                    });
+  TRACE_COUNTER("events", "Busy ranks", ++busy_ranks_);
+  if (--launch->left == 0) delete launch;
+  return DPU_OK;
+}
+
+static dpu_error_t on_rank_end(dpu_set_t, uint32_t rank_id, void* arg) {
+  auto* launch = static_cast<RankLaunch*>(arg);
+  TRACE_EVENT_END("events", rank_track(launch->first_rank + rank_id));
+  TRACE_COUNTER("events", "Busy ranks", --busy_ranks_);
+  if (--launch->left == 0) delete launch;
+  return DPU_OK;
+}
+
+// Blocking, so each rank's callbacks run in stream order.
+static void queue_rank_callback(dpu_set_t set,
+                                dpu_error_t (*fn)(dpu_set_t, uint32_t, void*),
+                                void* arg) {
+  DPU_ASSERT(dpu_callback(set, fn, arg, DPU_CALLBACK_ASYNC));
+}
+
+void* rank_launch_begin(dpu_set_t set, uint32_t first_rank, uint32_t nr_ranks,
+                        LaunchTag tag, bool flow) {
+  if (!enabled() || !tag) return nullptr;
+  auto* launch =
+      new RankLaunch{std::move(tag), first_rank, flow, {2 * nr_ranks}};
+  queue_rank_callback(set, on_rank_begin, launch);
+  return launch;
+}
+
+void rank_launch_end(dpu_set_t set, void* launch) {
+  if (launch) queue_rank_callback(set, on_rank_end, launch);
+}
+
+void rank_span_begin(uint32_t rank, const char* name, const char* binary) {
+  if (!enabled()) return;
+  if (binary)
+    TRACE_EVENT_BEGIN("events", perfetto::DynamicString(name), rank_track(rank),
+                      "binary", perfetto::DynamicString(binary));
+  else
+    TRACE_EVENT_BEGIN("events", perfetto::DynamicString(name), rank_track(rank));
+}
+
+void rank_span_end(uint32_t rank) {
+  if (!enabled()) return;
+  TRACE_EVENT_END("events", rank_track(rank));
 }
 
 }  // namespace trace

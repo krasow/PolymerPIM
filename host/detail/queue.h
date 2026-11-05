@@ -11,6 +11,9 @@ namespace detail {
 // Sets the Perfetto slice name for `e` from its kernel and JIT binary.
 void name_event(const std::shared_ptr<Event>& e);
 
+// The event this thread is dispatching, or null.
+const Event* dispatching_event();
+
 // Compiles a lone fused kernel that never joined a JIT batch.
 void compile_kernel_if_unbatched(const std::shared_ptr<Event>& e);
 

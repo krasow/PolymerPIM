@@ -6,6 +6,7 @@
 
 #include "allocator.h"
 #include "backend.h"
+#include "perfetto/detail/trace.h"
 
 #define CHECK_UPMEM(x) DPU_ASSERT(x)
 
@@ -65,6 +66,7 @@ class NativeBackend final : public DpuBackend {
     profile += BACKEND;
     CHECK_UPMEM(dpu_alloc(num_dpus, profile.c_str(), &set_));
     CHECK_UPMEM(dpu_get_nr_dpus(set_, &num_dpus_));
+    CHECK_UPMEM(dpu_get_nr_ranks(set_, &nr_ranks_));
     load(binary);
 
     constexpr size_t dpu_mem = 64 * 1024 * 1024;  // 64MB per DPU
@@ -169,7 +171,10 @@ class NativeBackend final : public DpuBackend {
       CHECK_UPMEM(dpu_push_xfer(set_, DPU_XFER_TO_DPU, "args", 0,
                                 sizeof(args[0]), DPU_XFER_DEFAULT));
     }
+    void* traced = trace::rank_launch_begin(set_, 0, nr_ranks_,
+                                            trace::current_launch(), true);
     CHECK_UPMEM(dpu_launch(set_, DPU_ASYNCHRONOUS));
+    trace::rank_launch_end(set_, traced);
   }
 
   void notify(std::function<void()> done) override {
@@ -202,6 +207,7 @@ class NativeBackend final : public DpuBackend {
 
   dpu_set_t set_{};
   uint32_t num_dpus_ = 0;
+  uint32_t nr_ranks_ = 0;
   bool open_ = false;
   std::unique_ptr<allocator> allocator_;
 };

@@ -349,6 +349,16 @@ void log_oom_requeued(const std::shared_ptr<Event>& e) {
 #endif
 }
 
+namespace {
+thread_local const Event* dispatching = nullptr;
+}  // namespace
+const Event* dispatching_event() { return dispatching; }
+
+struct DispatchingScope {
+  const Event* outer = dispatching;
+  explicit DispatchingScope(const Event* e) { dispatching = e; }
+  ~DispatchingScope() { dispatching = outer; }
+};
 }  // namespace detail
 // The EventQueue members below are the mechanics those helpers serve.
 using namespace detail;
@@ -572,6 +582,8 @@ void EventQueue::switch_dpu_binary(const std::shared_ptr<Event>& e) {
   log_binary_loaded();
 }
 void EventQueue::dispatch(const std::shared_ptr<Event>& e) {
+  trace::dispatch_scope trace_dispatch(e);
+  detail::DispatchingScope dispatching(e.get());
   log_dispatch(e, "begin");
   switch (e->op) {
     case Event::OperationType::FENCE:

@@ -17,7 +17,9 @@
 
 #include "backend.h"
 #include "default_mapper.h"
+#include "detail/queue.h"
 #include "mapper.h"
+#include "perfetto/detail/trace.h"
 #include "realm/upmem/upmem_api.h"
 #include "realm/upmem/upmem_internal.h"
 #include "realm/upmem/upmem_layout.h"
@@ -86,6 +88,13 @@ struct Launch {
   std::string binary;
   // Per point; kept until the launch is reaped since the push is async.
   std::vector<std::vector<DPU_LAUNCH_ARGS>> args;
+  // Names the kernels in traces; the last point to start drops it, so its
+  // event ends with them rather than when the launch is reaped.
+  struct Traced {
+    trace::LaunchTag tag;
+    std::atomic<uint32_t> points;
+  };
+  std::unique_ptr<Traced> traced;
 };
 
 // Binary loaded on each rank; changed only by that rank's kernel task.
@@ -102,7 +111,11 @@ void ensure_binary(RankDPU& rank, dpu_set_t* stream,
   }
   // Earlier kernels must finish on their own binary.
   CHECK_UPMEM(dpu_sync(*stream));
+  const std::string name =
+      "load " + binary.substr(binary.find_last_of('/') + 1);
+  trace::rank_span_begin(rank_index(&rank), name.c_str(), binary.c_str());
   CHECK_UPMEM(dpu_load(*stream, binary.c_str(), nullptr));
+  trace::rank_span_end(rank_index(&rank));
   std::lock_guard<std::mutex> lock(resident_mutex);
   resident[&rank] = binary;
 }
@@ -256,7 +269,15 @@ int kernel_task(const Task* task, const std::vector<PhysicalRegion>& regions,
   // Async: a sync transfer behind pending async work can crash the SDK.
   CHECK_UPMEM(dpu_push_xfer(*stream, DPU_XFER_TO_DPU, "args", 0,
                             sizeof(DPU_LAUNCH_ARGS), DPU_XFER_ASYNC));
+  void* traced = nullptr;
+  if (launch.traced) {
+    traced = trace::rank_launch_begin(*stream, rank_index(rank), 1,
+                                      launch.traced->tag,
+                                      task->index_point[0] == 0);
+    if (--launch.traced->points == 0) launch.traced->tag.reset();
+  }
   CHECK_UPMEM(dpu_launch(*stream, DPU_ASYNCHRONOUS));
+  trace::rank_launch_end(*stream, traced);
   return 0;
 }
 
@@ -324,6 +345,7 @@ class LegionBackend final : public DpuBackend {
             "DPUs");
     num_ranks_ = (uint32_t)ranks.size();
     num_dpus_ = num_ranks_ * dpus_per_rank_;
+    trace::set_concurrent_ranks();
 
     load(binary);
     open_ = true;
@@ -501,7 +523,8 @@ class LegionBackend final : public DpuBackend {
               const std::vector<detail::VectorDescRef>& writes,
               const FillArgs& fill, const InspectArgs& inspect) override {
     reap(false);
-    auto pending = std::make_unique<Launch>(Launch{fill, inspect, {}, binary_});
+    auto pending = std::make_unique<Launch>(
+        Launch{fill, inspect, {}, binary_, {}, nullptr});
     std::vector<Storage*> regions;
     auto add = [&](const detail::VectorDescRef& vec, PrivilegeMode privilege) {
       if (!vec) return;
@@ -521,11 +544,18 @@ class LegionBackend final : public DpuBackend {
 
     const Placement placement = place(pending->operands, regions);
     pending->args.resize(placement.ranks);
+    if (trace::LaunchTag tag = trace::current_launch())
+      pending->traced.reset(
+          new Launch::Traced{std::move(tag), {placement.ranks}});
 
     Launch* raw = pending.get();
     IndexLauncher launcher(KERNEL_TASK_ID, colors(placement.ranks),
                            TaskArgument(&raw, sizeof(raw)), ArgumentMap());
     launcher.tag = (MappingTagID)placement.first << PLACEMENT_TAG_SHIFT;
+    // Legion Prof shows this on hover.
+    if (const Event* e = detail::dispatching_event())
+      launcher.provenance =
+          e->slice_name + " [event " + std::to_string(e->id) + "]";
     for (size_t i = 0; i < regions.size(); i++) {
       // Exact instances: shards depend on instance bounds (check_aligned).
       launcher.add_region_requirement(RegionRequirement(
