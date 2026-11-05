@@ -17,6 +17,7 @@
 
 #include "backend.h"
 #include "default_mapper.h"
+#include "detail/queue.h"
 #include "mapper.h"
 #include "perfetto/detail/trace.h"
 #include "realm/upmem/upmem_api.h"
@@ -549,6 +550,10 @@ class LegionBackend final : public DpuBackend {
     IndexLauncher launcher(KERNEL_TASK_ID, colors(placement.ranks),
                            TaskArgument(&raw, sizeof(raw)), ArgumentMap());
     launcher.tag = (MappingTagID)placement.first << PLACEMENT_TAG_SHIFT;
+    // Legion Prof shows this on hover.
+    if (const Event* e = detail::dispatching_event())
+      launcher.provenance =
+          e->slice_name + " [event " + std::to_string(e->id) + "]";
     for (size_t i = 0; i < regions.size(); i++) {
       // Exact instances: shards depend on instance bounds (check_aligned).
       launcher.add_region_requirement(RegionRequirement(
