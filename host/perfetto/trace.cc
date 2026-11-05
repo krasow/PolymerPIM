@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
 #include "perfetto/detail/trace.h"
@@ -169,7 +170,7 @@ PERFETTO_DEFINE_CATEGORIES(
 PERFETTO_TRACK_EVENT_STATIC_STORAGE();
 
 static std::unique_ptr<perfetto::TracingSession> tracing_session_;
-static bool tracing_enabled_ = false;
+static std::atomic<bool> tracing_enabled_{false};
 static bool concurrent_ranks_ = false;
 
 static bool truthy_env(const char* value) {
@@ -672,15 +673,23 @@ static void add_event_metadata(perfetto::EventContext& ctx,
 
 namespace trace {
 
-void initialize() {
-  tracing_enabled_ = requested();
-  if (!tracing_enabled_) return;
-  if (tracing_session_) return;
+static std::string session_path_;  // where the running session is written
+static bool session_global_ = false;  // started from POLYMERPIM_TRACE
 
-  perfetto::TracingInitArgs args;
-  args.backends |= perfetto::kInProcessBackend;
-  perfetto::Tracing::Initialize(args);
-  perfetto::TrackEvent::Register();
+static void start_session(const std::string& path) {
+  static std::once_flag initialized;
+  std::call_once(initialized, [] {
+    perfetto::TracingInitArgs args;
+    args.backends |= perfetto::kInProcessBackend;
+    perfetto::Tracing::Initialize(args);
+    perfetto::TrackEvent::Register();
+
+    auto jit_track_desc = perfetto::Track(8080).Serialize();
+    jit_track_desc.set_name("JIT Compiler");
+    jit_track_desc.set_parent_uuid(perfetto::ProcessTrack::Current().uuid);
+    perfetto::TrackEvent::SetTrackDescriptor(perfetto::Track(8080),
+                                             jit_track_desc);
+  });
 
   perfetto::TraceConfig cfg;
   cfg.add_buffers()->set_size_kb(64 * 1024);
@@ -690,64 +699,74 @@ void initialize() {
   tracing_session_ = perfetto::Tracing::NewTrace(perfetto::kInProcessBackend);
   tracing_session_->Setup(cfg);
   tracing_session_->StartBlocking();
+  session_path_ = path;
+  tracing_enabled_ = true;
+}
 
-  auto jit_track_desc = perfetto::Track(8080).Serialize();
-  jit_track_desc.set_name("JIT Compiler");
-  jit_track_desc.set_parent_uuid(perfetto::ProcessTrack::Current().uuid);
-  perfetto::TrackEvent::SetTrackDescriptor(perfetto::Track(8080),
-                                           jit_track_desc);
+// Stops the running session and writes it to session_path_.  Returns an error
+// message, or an empty string once written.
+static std::string write_session(Logger* logger) {
+  tracing_enabled_ = false;
+  auto log = [logger](const std::string& msg) {
+    if (logger) logger->lock(logcat::TRACE_IO) << msg << std::endl;
+  };
+  log("Flushing TrackEvent buffers...");
+  perfetto::TrackEvent::Flush();
+  bool flushed = tracing_session_->FlushBlocking(5000);
+  log(std::string("FlushBlocking result=") + (flushed ? "ok" : "timeout"));
+  tracing_session_->StopBlocking();
+  std::vector<char> trace_data = tracing_session_->ReadTraceBlocking();
+  tracing_session_.reset();
+
+  const std::string& filename = session_path_;
+  std::error_code ec;
+  std::filesystem::path trace_path(filename);
+  if (trace_path.has_parent_path())
+    std::filesystem::create_directories(trace_path.parent_path(), ec);
+  std::ofstream out(filename, std::ios::binary);
+  if (!out) return "Failed to open trace output " + filename;
+  out.write(trace_data.data(), trace_data.size());
+  out.close();
+  if (!out) return "Failed while writing trace output " + filename;
+  log("Trace written to " + filename + " (" +
+      std::to_string(trace_data.size()) + " bytes)");
+  return {};
+}
+
+void initialize() {
+  if (tracing_session_ || !requested()) return;
+  start_session(output_path());
+  session_global_ = true;
 }
 
 void shutdown() {
-  if (!tracing_enabled_) return;
-  if (tracing_session_) {
-    Logger& logger = DpuRuntime::get().get_logger();
-    logger.lock(logcat::TRACE_IO)
-        << "Flushing TrackEvent buffers..." << std::endl;
-    perfetto::TrackEvent::Flush();
-    logger.lock(logcat::TRACE_IO) << "Flushing tracing session..." << std::endl;
-    bool flushed = tracing_session_->FlushBlocking(5000);
-    logger.lock(logcat::TRACE_IO)
-        << "FlushBlocking result=" << (flushed ? "ok" : "timeout") << std::endl;
-    logger.lock(logcat::TRACE_IO) << "Stopping tracing session..." << std::endl;
-    tracing_session_->StopBlocking();
-    logger.lock(logcat::TRACE_IO) << "Reading trace data..." << std::endl;
-    std::vector<char> trace_data = tracing_session_->ReadTraceBlocking();
+  if (!tracing_session_) return;
+  Logger& logger = DpuRuntime::get().get_logger();
+  std::string error = write_session(&logger);
+  if (!error.empty()) logger.lock(logcat::TRACE_IO) << error << std::endl;
+}
 
-    std::string filename = output_path();
+void start(const std::string& path) {
+  // POLYMERPIM_TRACE wins even before the runtime has started it.
+  if (!tracing_session_ && requested()) initialize();
+  if (tracing_session_)
+    throw std::runtime_error(
+        session_global_
+            ? "POLYMERPIM_TRACE is recording this run to " + session_path_ +
+                  "; unset it to trace a scope"
+            : "a trace is already recording to " + session_path_);
+  start_session(std::filesystem::absolute(path).string());
+  session_global_ = false;
+}
 
-    std::error_code ec;
-    std::filesystem::path trace_path(filename);
-    if (trace_path.has_parent_path()) {
-      std::filesystem::create_directories(trace_path.parent_path(), ec);
-      if (ec) {
-        logger.lock(logcat::TRACE_IO) << "Failed to create trace directory "
-                                      << trace_path.parent_path().string()
-                                      << ": " << ec.message() << std::endl;
-      }
-    }
-
-    std::ofstream out(filename, std::ios::binary);
-    if (!out) {
-      logger.lock(logcat::TRACE_IO)
-          << "Failed to open trace output " << filename << std::endl;
-      return;
-    }
-    out.write(trace_data.data(), trace_data.size());
-    out.close();
-    if (!out) {
-      logger.lock(logcat::TRACE_IO)
-          << "Failed while writing trace output " << filename << std::endl;
-      return;
-    }
-    logger.lock(logcat::TRACE_IO)
-        << "Trace written to " << filename << " (" << trace_data.size()
-        << " bytes)" << std::endl;
-    tracing_session_.reset();
-    perfetto::Tracing::Shutdown();
-    logger.lock(logcat::TRACE_IO) << "Perfetto shutdown complete." << std::endl;
-  }
-  tracing_enabled_ = false;
+std::string stop() {
+  if (!tracing_session_ || session_global_)
+    throw std::runtime_error("no scoped trace is recording");
+  DpuRuntime& runtime = DpuRuntime::get();
+  std::string error =
+      write_session(runtime.is_initialized() ? &runtime.get_logger() : nullptr);
+  if (!error.empty()) throw std::runtime_error(error);
+  return session_path_;
 }
 
 void internal_reduction_begin(uint64_t flow_id) {

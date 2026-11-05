@@ -7,6 +7,7 @@
 #include <jit.h>
 #include <logger.h>
 #include <opinfo.h>
+#include <perfetto/trace.h>
 #include <stats.h>
 
 // The Julia package targets the configuration the library is meant to be used
@@ -409,6 +410,12 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod) {
   mod.method("dpu_fence", [](Vec& v) { v.add_fence(); });
   mod.method("dpu_sync", []() { dpu_fence(); });
   mod.method("cleanup", []() { DpuRuntime::get().shutdown(); });
+
+  // ---- scoped tracing (@trace) ----
+
+  mod.method("trace_start",
+             [](const std::string& path) { trace::start(path); });
+  mod.method("trace_stop", []() -> std::string { return trace::stop(); });
 
   // ---- log capture (@show_log) ----
   //
