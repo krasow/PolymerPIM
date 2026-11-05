@@ -656,7 +656,11 @@ class LegionBackend final : public DpuBackend {
       FieldAllocator alloc = runtime_->create_field_allocator(ctx_, fs);
       alloc.allocate_field(element_size, FID_DATA);
     }
-    return runtime_->create_logical_region(ctx_, is, fs);
+    LogicalRegion lr = runtime_->create_logical_region(ctx_, is, fs);
+    // Zero-fill so reading a never-written vector is not an uninitialized read.
+    const uint64_t zero = 0;
+    runtime_->fill_field(ctx_, lr, lr, FID_DATA, &zero, element_size);
+    return lr;
   }
 
   detail::VectorDescRef add_vector(size_t n, Storage s) {
