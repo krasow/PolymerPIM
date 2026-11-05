@@ -16,6 +16,7 @@ extern "C" {
 std::string operationtype_to_string(Event::OperationType op);
 
 #define DPU_TRACK_ID uint64_t(0x1000)
+#define DISPATCH_TRACK_ID uint64_t(0x1001)
 #define EVENT_TRACK_BASE uint64_t(0x2000)
 #define RANK_TRACK_BASE uint64_t(0x3000)
 
