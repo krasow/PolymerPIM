@@ -55,7 +55,8 @@ void* rank_launch_begin(dpu_set_t set, uint32_t first_rank, uint32_t nr_ranks,
                         LaunchTag tag, bool flow);
 void rank_launch_end(dpu_set_t set, void* launch);
 // A host-side step on one rank's track, e.g. loading a binary.
-void rank_span_begin(uint32_t rank, const char* name);
+void rank_span_begin(uint32_t rank, const char* name,
+                     const char* binary = nullptr);
 void rank_span_end(uint32_t rank);
 #else
 inline void event_enqueued(std::shared_ptr<Event> e,
@@ -93,9 +94,11 @@ inline void rank_launch_end(dpu_set_t set, void* launch) {
   (void)set;
   (void)launch;
 }
-inline void rank_span_begin(uint32_t rank, const char* name) {
+inline void rank_span_begin(uint32_t rank, const char* name,
+                            const char* binary = nullptr) {
   (void)rank;
   (void)name;
+  (void)binary;
 }
 inline void rank_span_end(uint32_t rank) { (void)rank; }
 #endif

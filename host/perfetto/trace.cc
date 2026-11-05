@@ -1086,9 +1086,13 @@ void rank_launch_end(dpu_set_t set, void* launch) {
   if (launch) queue_rank_callback(set, on_rank_end, launch);
 }
 
-void rank_span_begin(uint32_t rank, const char* name) {
+void rank_span_begin(uint32_t rank, const char* name, const char* binary) {
   if (!enabled()) return;
-  TRACE_EVENT_BEGIN("events", perfetto::DynamicString(name), rank_track(rank));
+  if (binary)
+    TRACE_EVENT_BEGIN("events", perfetto::DynamicString(name), rank_track(rank),
+                      "binary", perfetto::DynamicString(binary));
+  else
+    TRACE_EVENT_BEGIN("events", perfetto::DynamicString(name), rank_track(rank));
 }
 
 void rank_span_end(uint32_t rank) {

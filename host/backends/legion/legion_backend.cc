@@ -111,7 +111,9 @@ void ensure_binary(RankDPU& rank, dpu_set_t* stream,
   }
   // Earlier kernels must finish on their own binary.
   CHECK_UPMEM(dpu_sync(*stream));
-  trace::rank_span_begin(rank_index(&rank), "load binary");
+  const std::string name =
+      "load " + binary.substr(binary.find_last_of('/') + 1);
+  trace::rank_span_begin(rank_index(&rank), name.c_str(), binary.c_str());
   CHECK_UPMEM(dpu_load(*stream, binary.c_str(), nullptr));
   trace::rank_span_end(rank_index(&rank));
   std::lock_guard<std::mutex> lock(resident_mutex);
