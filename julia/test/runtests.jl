@@ -9,7 +9,7 @@ const N = 4096
 #   julia --project=. test/runtests.jl broadcast internal
 const SUITES = ["core", "elementwise", "reductions", "inplace",
                 "kary", "scatter", "broadcast", "jit", "logging", "timing",
-                "tracing", "internal"]
+                "tracing", "internal", "ndarray"]
 
 const SELECTED = isempty(ARGS) ? SUITES :
     filter(s -> any(a -> occursin(a, s), ARGS), SUITES)

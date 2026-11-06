@@ -47,6 +47,24 @@ of falling back to a host loop.
 Host scalars are captured when an expression is built but passed at launch, so
 different values reuse the same compiled kernel.
 
+## Arrays up to 3-D
+
+`DPUArray{N}` holds up to 3 dimensions; `DPUVector` and `DPUMatrix` are the
+1-D and 2-D cases. The DPUs see the same flat column-major vector, so
+`reshape` and `vec` move no data and share storage.
+
+```julia
+A = DPUArray(rand(Int32, 4, 5, 6))
+B = A .* 2 .+ A           # one fused pass, still 4×5×6
+sum(B)[]                  # whole-array reduction
+findmax(A)                # (value, CartesianIndex)
+M = reshape(A, 20, :)     # 20×6 DPUMatrix over the same storage
+Array(B)                  # Array{Int32,3}
+```
+
+Operands must have equal shapes: there is no singleton expansion
+(`M .+ row` raises `DimensionMismatch`), and no `dims=` reductions.
+
 ## Timing
 
 `@dputime` measures one synchronized execution and returns its value:

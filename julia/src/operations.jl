@@ -5,63 +5,75 @@
 
 # ---- generic dispatch functions ----
 
-function binary_op(a::DPUVector, b::DPUVector, op::UInt8)
+# Elementwise only: no singleton expansion, so shapes must match exactly.
+function _same_size(a, bs...)
+    for b in bs
+        size(a) == size(b) || throw(DimensionMismatch(
+            "arrays have sizes $(size(a)) and $(size(b)); DPU operations need " *
+            "equal shapes (no singleton broadcasting)"))
+    end
+    return size(a)
+end
+
+function binary_op(a::DPUArray, b::DPUArray, op::UInt8)
+    _same_size(a, b)
     handle = retry_on_oom(() -> PolymerPIM.launch_binary(a.handle, b.handle, op))
-    return DPUVector(handle)
+    return _like(a, handle)
 end
 
-function scalar_op(a::DPUVector, s::Integer, op::UInt8)
+function scalar_op(a::DPUArray, s::Integer, op::UInt8)
     handle = retry_on_oom(() -> PolymerPIM.launch_binary_scalar(a.handle, Int32(s), op))
-    return DPUVector(handle)
+    return _like(a, handle)
 end
 
-function unary_op(a::DPUVector, op::UInt8)
+function unary_op(a::DPUArray, op::UInt8)
     handle = retry_on_oom(() -> PolymerPIM.launch_unary(a.handle, op))
-    return DPUVector(handle)
+    return _like(a, handle)
 end
 
-function select_op(cond::DPUVector, a::DPUVector, b::DPUVector)
+function select_op(cond::DPUArray, a::DPUArray, b::DPUArray)
+    _same_size(cond, a, b)
     handle = retry_on_oom(() -> PolymerPIM.launch_select(cond.handle, a.handle, b.handle))
-    return DPUVector(handle)
+    return _like(a, handle)
 end
 
 # ---- Base overloads: binary vector ⊕ vector ----
 
-Base.:+(a::DPUVector, b::DPUVector) = binary_op(a, b, Internal.Opcodes.OP_ADD)
-Base.:-(a::DPUVector, b::DPUVector) = binary_op(a, b, Internal.Opcodes.OP_SUB)
-Base.:*(a::DPUVector, b::DPUVector) = binary_op(a, b, Internal.Opcodes.OP_MUL)
-Base.div(a::DPUVector, b::DPUVector) = binary_op(a, b, Internal.Opcodes.OP_DIV)
-Base.:<(a::DPUVector, b::DPUVector)  = binary_op(a, b, Internal.Opcodes.OP_LT)
+Base.:+(a::DPUArray, b::DPUArray) = binary_op(a, b, Internal.Opcodes.OP_ADD)
+Base.:-(a::DPUArray, b::DPUArray) = binary_op(a, b, Internal.Opcodes.OP_SUB)
+Base.:*(a::DPUArray, b::DPUArray) = binary_op(a, b, Internal.Opcodes.OP_MUL)
+Base.div(a::DPUArray, b::DPUArray) = binary_op(a, b, Internal.Opcodes.OP_DIV)
+Base.:<(a::DPUArray, b::DPUArray)  = binary_op(a, b, Internal.Opcodes.OP_LT)
 
 # ---- Base overloads: vector ⊕ scalar / scalar ⊕ vector ----
 
-Base.:+(a::DPUVector, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_ADD_SCALAR)
-Base.:+(s::Integer, a::DPUVector) = scalar_op(a, s, Internal.Opcodes.OP_ADD_SCALAR)
-Base.:-(a::DPUVector, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_SUB_SCALAR)
-Base.:*(a::DPUVector, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_MUL_SCALAR)
-Base.:*(s::Integer, a::DPUVector) = scalar_op(a, s, Internal.Opcodes.OP_MUL_SCALAR)
-Base.div(a::DPUVector, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_DIV_SCALAR)
-Base.:>>(a::DPUVector, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_ASR_SCALAR)
-Base.:(==)(a::DPUVector, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_EQ_SCALAR)
+Base.:+(a::DPUArray, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_ADD_SCALAR)
+Base.:+(s::Integer, a::DPUArray) = scalar_op(a, s, Internal.Opcodes.OP_ADD_SCALAR)
+Base.:-(a::DPUArray, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_SUB_SCALAR)
+Base.:*(a::DPUArray, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_MUL_SCALAR)
+Base.:*(s::Integer, a::DPUArray) = scalar_op(a, s, Internal.Opcodes.OP_MUL_SCALAR)
+Base.div(a::DPUArray, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_DIV_SCALAR)
+Base.:>>(a::DPUArray, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_ASR_SCALAR)
+Base.:(==)(a::DPUArray, s::Integer) = scalar_op(a, s, Internal.Opcodes.OP_EQ_SCALAR)
 
 # ---- Base overloads: unary ----
 
-Base.:-(a::DPUVector)  = unary_op(a, Internal.Opcodes.OP_NEGATE)
-Base.abs(a::DPUVector) = unary_op(a, Internal.Opcodes.OP_ABS)
+Base.:-(a::DPUArray)  = unary_op(a, Internal.Opcodes.OP_NEGATE)
+Base.abs(a::DPUArray) = unary_op(a, Internal.Opcodes.OP_ABS)
 
 # ---- Base overloads: reductions ----
 
 # Futures, not numbers: left unread, independent reductions share a kernel.
-Base.sum(v::DPUVector)     = Internal.reduce_lazy(v, Internal.Opcodes.OP_SUM)
-Base.prod(v::DPUVector)    = Internal.reduce_lazy(v, Internal.Opcodes.OP_PRODUCT)
-Base.minimum(v::DPUVector) = Internal.reduce_lazy(v, Internal.Opcodes.OP_MIN)
-Base.maximum(v::DPUVector) = Internal.reduce_lazy(v, Internal.Opcodes.OP_MAX)
+Base.sum(v::DPUArray)     = Internal.reduce_lazy(v, Internal.Opcodes.OP_SUM)
+Base.prod(v::DPUArray)    = Internal.reduce_lazy(v, Internal.Opcodes.OP_PRODUCT)
+Base.minimum(v::DPUArray) = Internal.reduce_lazy(v, Internal.Opcodes.OP_MIN)
+Base.maximum(v::DPUArray) = Internal.reduce_lazy(v, Internal.Opcodes.OP_MAX)
 
 # `sum(f, v)`: f is traced once over a DpuExpr and the terminal appended, so
 # unlike `sum(f.(v))` there is no intermediate.
 for (f, terminal) in ((:sum, :sum), (:prod, :prod),
                       (:minimum, :minimum), (:maximum, :maximum))
-    @eval Base.$f(f, v::DPUVector) =
+    @eval Base.$f(f, v::DPUArray) =
         Internal.dpu_pipeline_reduce(v, $terminal(_trace(f)))
 end
 
@@ -70,40 +82,44 @@ const MAPREDUCE_TERMINALS = Dict{Any,Function}(
 
 # ---- Base overloads: which element won ----
 # One pair-valued terminal carries the Int32 value and UInt32 global index.
-function _arg_reduce(v::DPUVector, want_max::Bool)
+function _arg_reduce(v::DPUArray, want_max::Bool)
     length(v) > 0 || throw(ArgumentError("collection must be non-empty"))
     terminal = want_max ? Internal._argmax_terminal : Internal._argmin_terminal
-    return Internal._dpu_argreduce(v, terminal(Internal.input()))
+    return _cartesian(size(v), Internal._dpu_argreduce(v, terminal(Internal.input())))
 end
 
+# Beyond 1-D the index is a CartesianIndex, as Base's is.
+_cartesian(::Tuple{Integer}, (value, i)) = (value, i)
+_cartesian(dims, (value, i)) = (value, CartesianIndices(dims)[i])
+
 """
-    findmax(v::DPUVector) -> (value, index)
-    findmin(v::DPUVector) -> (value, index)
+    findmax(v::DPUArray) -> (value, index)
+    findmin(v::DPUArray) -> (value, index)
 
 The extreme value and the first index holding it, as Base's do. The value is an
 `Int64`, the type a DPU reduction returns, not the vector's `Int32`.
 
 One DPU pass; only the value/index pair comes back and the vector stays put.
 """
-Base.findmax(v::DPUVector) = _arg_reduce(v, true)
-Base.findmin(v::DPUVector) = _arg_reduce(v, false)
+Base.findmax(v::DPUArray) = _arg_reduce(v, true)
+Base.findmin(v::DPUArray) = _arg_reduce(v, false)
 
 """
-    argmax(v::DPUVector) -> Int
-    argmin(v::DPUVector) -> Int
+    argmax(v::DPUArray) -> Int
+    argmin(v::DPUArray) -> Int
 
 The first index holding the extreme value; see [`findmax`](@ref).
 """
-Base.argmax(v::DPUVector) = _arg_reduce(v, true)[2]
-Base.argmin(v::DPUVector) = _arg_reduce(v, false)[2]
+Base.argmax(v::DPUArray) = _arg_reduce(v, true)[2]
+Base.argmin(v::DPUArray) = _arg_reduce(v, false)[2]
 
 """
-    mapreduce(f, op, v::DPUVector)
+    mapreduce(f, op, v::DPUArray)
 
 One kernel pass: `f` is traced into the program and `op` becomes its reduction
 terminal. `op` must be `+`, `*`, `min` or `max`.
 """
-function Base.mapreduce(f, op, v::DPUVector)
+function Base.mapreduce(f, op, v::DPUArray)
     terminal = get(MAPREDUCE_TERMINALS, op, nothing)
     terminal === nothing && throw(ArgumentError(
         "mapreduce over a DPUVector needs op in (+, *, min, max), got $op"))
@@ -130,26 +146,27 @@ end
 Apply an operation to `a` in place. `b` may be a `DPUVector` or an integer.
 Returns `a`.
 """
-function apply!(a::DPUVector, b::DPUVector, op::UInt8)
+function apply!(a::DPUArray, b::DPUArray, op::UInt8)
+    _same_size(a, b)
     retry_on_oom(() -> PolymerPIM.var"apply_binary!"(a.handle, b.handle, op))
     return a
 end
 
-function apply!(a::DPUVector, s::Integer, op::UInt8)
+function apply!(a::DPUArray, s::Integer, op::UInt8)
     retry_on_oom(() -> PolymerPIM.var"apply_scalar!"(a.handle, Int32(s), op))
     return a
 end
 
-add!(a::DPUVector, b::DPUVector) = apply!(a, b, Internal.Opcodes.OP_ADD)
-sub!(a::DPUVector, b::DPUVector) = apply!(a, b, Internal.Opcodes.OP_SUB)
-mul!(a::DPUVector, b::DPUVector) = apply!(a, b, Internal.Opcodes.OP_MUL)
-div!(a::DPUVector, b::DPUVector) = apply!(a, b, Internal.Opcodes.OP_DIV)
+add!(a::DPUArray, b::DPUArray) = apply!(a, b, Internal.Opcodes.OP_ADD)
+sub!(a::DPUArray, b::DPUArray) = apply!(a, b, Internal.Opcodes.OP_SUB)
+mul!(a::DPUArray, b::DPUArray) = apply!(a, b, Internal.Opcodes.OP_MUL)
+div!(a::DPUArray, b::DPUArray) = apply!(a, b, Internal.Opcodes.OP_DIV)
 
-add!(a::DPUVector, s::Integer) = apply!(a, s, Internal.Opcodes.OP_ADD_SCALAR)
-sub!(a::DPUVector, s::Integer) = apply!(a, s, Internal.Opcodes.OP_SUB_SCALAR)
-mul!(a::DPUVector, s::Integer) = apply!(a, s, Internal.Opcodes.OP_MUL_SCALAR)
-div!(a::DPUVector, s::Integer) = apply!(a, s, Internal.Opcodes.OP_DIV_SCALAR)
-shr!(a::DPUVector, s::Integer) = apply!(a, s, Internal.Opcodes.OP_ASR_SCALAR)
+add!(a::DPUArray, s::Integer) = apply!(a, s, Internal.Opcodes.OP_ADD_SCALAR)
+sub!(a::DPUArray, s::Integer) = apply!(a, s, Internal.Opcodes.OP_SUB_SCALAR)
+mul!(a::DPUArray, s::Integer) = apply!(a, s, Internal.Opcodes.OP_MUL_SCALAR)
+div!(a::DPUArray, s::Integer) = apply!(a, s, Internal.Opcodes.OP_DIV_SCALAR)
+shr!(a::DPUArray, s::Integer) = apply!(a, s, Internal.Opcodes.OP_ASR_SCALAR)
 
 export apply!, add!, sub!, mul!, div!, shr!
 
@@ -160,8 +177,8 @@ export apply!, add!, sub!, mul!, div!, shr!
 
 struct DpuStyle <: Base.Broadcast.BroadcastStyle end
 
-Base.broadcastable(v::DPUVector) = v
-Base.BroadcastStyle(::Type{DPUVector}) = DpuStyle()
+Base.broadcastable(v::DPUArray) = v
+Base.BroadcastStyle(::Type{<:DPUArray}) = DpuStyle()
 Base.BroadcastStyle(::DpuStyle, ::Base.Broadcast.BroadcastStyle) = DpuStyle()
 
 # Operators reachable inside a broadcast, mapped to the expression builder.
@@ -195,16 +212,16 @@ end
 # Which vector became input(), and the operand slots so far.  Matched by object
 # identity, so a vector used twice is loaded once.
 mutable struct _Lowering
-    primary::Union{Nothing,DPUVector}
-    operands::Vector{DPUVector}
+    primary::Union{Nothing,DPUArray}
+    operands::Vector{DPUArray}
     inlined::Vector{Any}    # the lazy values folded into this program
     scalar_slots::IdDict{_DpuScalar,Int}
     scalars::Vector{Int32}  # launch-time values, in slot order
 end
-_Lowering() = _Lowering(nothing, DPUVector[], Any[],
+_Lowering() = _Lowering(nothing, DPUArray[], Any[],
                         IdDict{_DpuScalar,Int}(), Int32[])
 
-function _leaf(v::DPUVector, st::_Lowering)
+function _leaf(v::DPUArray, st::_Lowering)
     if st.primary === nothing
         st.primary = v
         return input()
@@ -220,7 +237,7 @@ function _leaf(v::DPUVector, st::_Lowering)
     return operand(length(st.operands))
 end
 
-_lower(v::DPUVector, st::_Lowering) = _leaf(v, st)
+_lower(v::DPUArray, st::_Lowering) = _leaf(v, st)
 
 # Reusing the same leaf reuses its slot.  This matters for scatter, which lowers
 # a shared index once per update before `_scatter_program` folds the common
@@ -315,13 +332,13 @@ end
 """
     DpuLazy
 
-An expression built but not run. `Array`, `DPUVector`, indexing, `fence` or a
+An expression built but not run. `Array`, `DPUArray`, indexing, `fence` or a
 reduction runs it; using it inside another expression inlines it instead.
 """
 mutable struct DpuLazy
     bc::Base.Broadcast.Broadcasted
-    len::Int
-    forced::Any     # the DPUVector once it has been run, so it runs once
+    dims::Tuple{Vararg{Int}}
+    forced::Any     # the DPUArray once it has been run, so it runs once
     consumed::Bool  # inlined into a submitted program, so it needs no run of its own
     uses::Int       # how many submitted programs folded it in
 end
@@ -330,30 +347,37 @@ end
 # as opposed to a step towards one.
 const _LAZY_REGISTRY = WeakRef[]
 
-function DpuLazy(bc::Base.Broadcast.Broadcasted, len::Int)
-    x = DpuLazy(_capture_scalars(bc), len, nothing, false, 0)
+function DpuLazy(bc::Base.Broadcast.Broadcasted, dims::Tuple{Vararg{Int}})
+    x = DpuLazy(_capture_scalars(bc), dims, nothing, false, 0)
     push!(_LAZY_REGISTRY, WeakRef(x))
     return x
 end
 
-Base.copy(bc::Base.Broadcast.Broadcasted{DpuStyle}) = DpuLazy(bc, _bclength(bc))
+Base.copy(bc::Base.Broadcast.Broadcasted{DpuStyle}) = DpuLazy(bc, _bcsize(bc))
 
-# The element count is the primary vector's, found without lowering anything.
-_bclength(x::DPUVector) = length(x)
-_bclength(x::DpuLazy) = x.len
-_bclength(::Any) = nothing
-function _bclength(bc::Base.Broadcast.Broadcasted)
+# The shape every array in the tree shares, found without lowering anything.
+# Base's own axes check allows singleton expansion, which the DPUs cannot do.
+_bcsize(x::DPUArray) = size(x)
+_bcsize(x::DpuLazy) = x.dims
+_bcsize(::Any) = nothing
+function _bcsize(bc::Base.Broadcast.Broadcasted)
+    dims = nothing
     for a in bc.args
-        n = _bclength(a)
-        n === nothing || return n
+        d = _bcsize(a)
+        d === nothing && continue
+        dims === nothing || dims == d || throw(DimensionMismatch(
+            "broadcast over sizes $dims and $d; DPU broadcasts need equal " *
+            "shapes (no singleton expansion)"))
+        dims = d
     end
-    return nothing
+    return dims
 end
 
-Base.length(x::DpuLazy) = x.len
-Base.size(x::DpuLazy) = (x.len,)
+Base.length(x::DpuLazy) = prod(x.dims)
+Base.size(x::DpuLazy) = x.dims
+Base.ndims(x::DpuLazy) = length(x.dims)
 Base.eltype(::DpuLazy) = Int32
-Base.axes(x::DpuLazy) = (Base.OneTo(x.len),)
+Base.axes(x::DpuLazy) = map(Base.OneTo, x.dims)
 Base.broadcastable(x::DpuLazy) = x
 Base.BroadcastStyle(::Type{DpuLazy}) = DpuStyle()
 
@@ -368,7 +392,7 @@ function _lower(x::DpuLazy, st::_Lowering)
     x.forced === nothing || return _leaf(x.forced, st)
     if x.uses > 0
         @warn """an unrun expression is being folded into a second program, so it \
-                 is computed once per consumer.  Hoist it with `DPUVector(x)` to \
+                 is computed once per consumer.  Hoist it with `DPUArray(x)` to \
                  compute it once and share the result.""" maxlog = 3
     end
     push!(st.inlined, x)
@@ -376,12 +400,12 @@ function _lower(x::DpuLazy, st::_Lowering)
 end
 
 """
-    DPUVector(x::DpuLazy)
+    DPUArray(x::DpuLazy)
 
-Run `x`, keeping the result on the DPUs. [`fence`](@ref) says the same thing
-without reading as a conversion.
+Run `x`, keeping the result on the DPUs in `x`'s shape. [`fence`](@ref) says
+the same thing without reading as a conversion.
 """
-function DPUVector(x::DpuLazy)
+function DPUArray(x::DpuLazy)
     x.forced === nothing || return x.forced
     # An expression that cannot be lowered is not retried: otherwise it stays
     # in the registry and the next `sync()` raises it again, far from whoever
@@ -397,15 +421,18 @@ function DPUVector(x::DpuLazy)
     return x.forced
 end
 
-Base.Array(x::DpuLazy) = Array(DPUVector(x))
+DPUArray{N}(x::DpuLazy) where {N} = (_check_same_ndims(N, ndims(x)); DPUArray(x)::DPUArray{N})
+
+Base.Array(x::DpuLazy) = Array(DPUArray(x))
 Base.Vector(x::DpuLazy) = Array(x)
 Base.collect(x::DpuLazy) = Array(x)
-Base.getindex(x::DpuLazy, i::Integer) = Array(x)[i]
+Base.getindex(x::DpuLazy, I::Integer...) = Array(x)[I...]
+Base.reshape(x::DpuLazy, dims...) = reshape(DPUArray(x), dims...)
 
 """
     fence(x::DpuLazy)
 
-Run `x`, block until it is done, return it. `fence(v::DPUVector)` waits for a
+Run `x`, block until it is done, return it. `fence(v::DPUArray)` waits for a
 vector's queued work; this also submits an expression that has not run.
 
 Only the named value runs. Its intermediates stay unrun -- forcing those would
@@ -415,13 +442,13 @@ cost a kernel and an MRAM buffer each.
     fence(res)           # runs here, so this is where the time is spent
     Array(res)           # already computed
 """
-fence(x::DpuLazy) = (fence(DPUVector(x)); x)
+fence(x::DpuLazy) = (fence(DPUArray(x)); x)
 
-const _Lane = Union{DPUVector,DpuLazy}
+const _Lane = Union{DPUArray,DpuLazy}
 
 # An operand slot needs a real vector; anything else passes through.
 _force(x) = x
-_force(x::DpuLazy) = DPUVector(x)
+_force(x::DpuLazy) = DPUArray(x)
 
 # ---- splitting an expression too wide for the operand table ----
 #
@@ -438,7 +465,7 @@ struct _Fitted
 end
 
 _vecs!(seen, ::Any) = nothing
-_vecs!(seen, v::DPUVector) = (push!(seen, v); nothing)
+_vecs!(seen, v::DPUArray) = (push!(seen, v); nothing)
 _vecs!(seen, x::DpuLazy) =
     x.forced === nothing ? _vecs!(seen, x.bc) : _vecs!(seen, x.forced)
 _vecs!(seen, bc::Base.Broadcast.Broadcasted) =
@@ -461,7 +488,7 @@ end
 # by then the program reading it is submitted, which is where C++ drops its own
 # handle.  `release!` only decrements the handle count, so a queued reader is
 # unaffected.
-const _CUT_TEMPS = DPUVector[]
+const _CUT_TEMPS = DPUArray[]
 
 function _release_cut_temps!()
     for v in _CUT_TEMPS
@@ -533,15 +560,15 @@ end
 
 # Operators on an unrun expression keep it unrun.  On a DPUVector they stay
 # eager: `a + b` is a statically compiled kernel.
-_lazy(bc::Base.Broadcast.Broadcasted) = DpuLazy(bc, _bclength(bc))
+_lazy(bc::Base.Broadcast.Broadcasted) = DpuLazy(bc, _bcsize(bc))
 
 Base.:-(x::DpuLazy) = _lazy(Base.broadcasted(-, x))
 Base.abs(x::DpuLazy) = _lazy(Base.broadcasted(abs, x))
 
 for f in (:+, :-, :*, :div, :(>>), :(==), :<, :>, :<=, :>=)
-    @eval Base.$f(x::DpuLazy, y::Union{DpuLazy,DPUVector,Integer}) =
+    @eval Base.$f(x::DpuLazy, y::Union{DpuLazy,DPUArray,Integer}) =
         _lazy(Base.broadcasted($f, x, y))
-    @eval Base.$f(x::Union{DPUVector,Integer}, y::DpuLazy) =
+    @eval Base.$f(x::Union{DPUArray,Integer}, y::DpuLazy) =
         _lazy(Base.broadcasted($f, x, y))
 end
 
@@ -560,10 +587,11 @@ for (f, terminal) in ((:sum, :sum), (:prod, :prod),
     end
 end
 
-Base.sum(f, x::DpuLazy) = sum(Base.broadcasted(f, x))
-Base.prod(f, x::DpuLazy) = prod(Base.broadcasted(f, x))
-Base.minimum(f, x::DpuLazy) = minimum(Base.broadcasted(f, x))
-Base.maximum(f, x::DpuLazy) = maximum(Base.broadcasted(f, x))
+# Lazy, so `f` joins the reduction's program rather than Base iterating it.
+Base.sum(f, x::DpuLazy) = sum(_lazy(Base.broadcasted(f, x)))
+Base.prod(f, x::DpuLazy) = prod(_lazy(Base.broadcasted(f, x)))
+Base.minimum(f, x::DpuLazy) = minimum(_lazy(Base.broadcasted(f, x)))
+Base.maximum(f, x::DpuLazy) = maximum(_lazy(Base.broadcasted(f, x)))
 
 # Fuse a lazy score expression directly into the native pair terminal.
 function _arg_reduce(x::DpuLazy, want_max::Bool)
@@ -573,8 +601,8 @@ function _arg_reduce(x::DpuLazy, want_max::Bool)
     x.consumed = true
     x.uses += 1
     terminal = want_max ? Internal._argmax_terminal : Internal._argmin_terminal
-    return Internal._dpu_argreduce(
-        primary, terminal(e); operands = operands, scalars = scalars)
+    return _cartesian(size(x), Internal._dpu_argreduce(
+        primary, terminal(e); operands = operands, scalars = scalars))
 end
 
 Base.findmin(x::DpuLazy) = _arg_reduce(x, false)
@@ -588,13 +616,13 @@ Base.argmax(x::DpuLazy) = findmax(x)[2]
 Writes through `dest`'s existing buffer, so other handles to it observe the
 result. One kernel pass.
 """
-Base.copyto!(dest::DPUVector, x::DpuLazy) =
+Base.copyto!(dest::DPUArray, x::DpuLazy) =
     (x.consumed = true; copyto!(dest, x.bc))
 
-function Base.copyto!(dest::DPUVector, bc::Base.Broadcast.Broadcasted{DpuStyle})
+function Base.copyto!(dest::DPUArray, bc::Base.Broadcast.Broadcasted{DpuStyle})
+    size(dest) == _bcsize(bc) || throw(DimensionMismatch(
+        "destination has size $(size(dest)), expression $(_bcsize(bc))"))
     e, primary, operands, scalars = _lower_tree(bc)
-    length(dest) == length(primary) || throw(DimensionMismatch(
-        "destination has $(length(dest)) elements, expression $(length(primary))"))
     Internal._check_program(e, operands)
     retry_on_oom(() -> PolymerPIM.launch_pipeline_into(
         dest.handle, primary.handle, e.ops, _veclist(operands), scalars))
@@ -602,12 +630,11 @@ function Base.copyto!(dest::DPUVector, bc::Base.Broadcast.Broadcasted{DpuStyle})
 end
 
 # A scalar fill still goes through the same path.
-Base.copyto!(dest::DPUVector, bc::Base.Broadcast.Broadcasted{Base.Broadcast.DefaultArrayStyle{0}}) =
+Base.copyto!(dest::DPUArray, bc::Base.Broadcast.Broadcasted{Base.Broadcast.DefaultArrayStyle{0}}) =
     copyto!(dest, Base.Broadcast.broadcasted(identity, bc.f(bc.args...)))
 
-Base.similar(v::DPUVector) = DPUVector(length(v))
-Base.similar(v::DPUVector, ::Type{Int32}) = DPUVector(length(v))
-Base.axes(v::DPUVector) = (Base.OneTo(length(v)),)
+Base.similar(v::DPUArray) = DPUArray(size(v))
+Base.similar(v::DPUArray, ::Type{Int32}) = DPUArray(size(v))
 
 export select_op
 
@@ -632,7 +659,7 @@ const DpuZip = Base.Iterators.Zip{<:Tuple{_Lane,Vararg{_Lane}}}
 # Any other broadcast over a zip would have Base collect it -- one readback
 # per element.
 Base.broadcastable(::DpuZip) = throw(ArgumentError(
-    "only argmin./argmax. are supported over zip(::DPUVector...); another " *
+    "only argmin./argmax. are supported over zip(::DPUArray...); another " *
     "broadcast would collect the vectors to the host one element at a time"))
 
 function _lane_program(nlanes::Integer, want_max::Bool)
@@ -650,8 +677,9 @@ Base.broadcasted(::typeof(argmin), z::DpuZip) =
 Base.broadcasted(::typeof(argmax), z::DpuZip) =
     Base.broadcasted(DpuStyle(), LaneArg{true}(), z.is...)
 
-function _find_lanes(vs::AbstractVector{DPUVector}, want_max::Bool)
+function _find_lanes(vs::AbstractVector{<:DPUArray}, want_max::Bool)
     isempty(vs) && throw(ArgumentError("need at least one vector"))
+    _same_size(vs...)
     lanes, label = _lane_program(length(vs), want_max)
     value = _best_expr(lanes, want_max)
     if MAX_CHAINS < 2   # room for one chain only; a pass each
@@ -674,8 +702,8 @@ tuples, which a DPU cannot hold, so the columns come back unzipped:
     values, labels = findmin_lanes([v1, v2, v3])
     collect(zip(Array(values), Array(labels))) == findmin.(zip(a1, a2, a3))
 """
-findmin_lanes(vs::AbstractVector{DPUVector}) = _find_lanes(vs, false)
-findmax_lanes(vs::AbstractVector{DPUVector}) = _find_lanes(vs, true)
+findmin_lanes(vs::AbstractVector{<:DPUArray}) = _find_lanes(vs, false)
+findmax_lanes(vs::AbstractVector{<:DPUArray}) = _find_lanes(vs, true)
 
 export findmin_lanes, findmax_lanes
 
@@ -698,7 +726,7 @@ holds coordinate `j` of every row. One fused pass over all columns.
 `vectordpu.h` declared a C++ `min_squared_distance` but never defined it, so
 this is built from the expression API instead.
 """
-function min_squared_distance(cols::AbstractVector{DPUVector},
+function min_squared_distance(cols::AbstractVector{<:DPUArray},
                               query::AbstractVector{<:Integer})
     isempty(cols) && throw(ArgumentError("need at least one column"))
     length(cols) == length(query) || throw(ArgumentError(
@@ -715,17 +743,17 @@ export min_squared_distance
 # ---- elementwise comparisons ----
 
 _materialize_broadcast(f, args...) =
-    DPUVector(Base.copy(Base.broadcasted(f, args...)))
+    DPUArray(Base.copy(Base.broadcasted(f, args...)))
 
 for f in (:>, :>=, :<=)
-    @eval Base.$f(a::DPUVector, b::DPUVector) =
+    @eval Base.$f(a::DPUArray, b::DPUArray) =
         _materialize_broadcast($f, a, b)
 end
 
-Base.:(==)(a::DPUVector, b::DPUVector) = _materialize_broadcast(==, a, b)
+Base.:(==)(a::DPUArray, b::DPUArray) = _materialize_broadcast(==, a, b)
 
 for f in (:>, :>=, :<=, :<)
-    @eval Base.$f(a::DPUVector, s::Integer) =
+    @eval Base.$f(a::DPUArray, s::Integer) =
         _materialize_broadcast($f, a, s)
 end
 
@@ -899,7 +927,7 @@ _mark_referenced(::Any, _) = nothing
 # it do not.
 function _run_dangling_lazies()
     for x in _dangling_lazies()
-        DPUVector(x)
+        DPUArray(x)
     end
     return nothing
 end
