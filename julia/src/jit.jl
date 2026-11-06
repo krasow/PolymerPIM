@@ -104,16 +104,16 @@ const _O = Internal.Opcodes
 # (OP_PUSH_INPUT), the rest operands.
 struct _Chain
     ops::Vector{UInt8}
-    inputs::Vector{DPUVector}
+    inputs::Vector{DPUArray}
     nscalars::Int
 end
 
 function _chain_of(f, bc::Base.Broadcast.Broadcasted)
     e, primary, operands, scalars = _lower_tree(bc; consume = false)
-    return _Chain(f(e).ops, DPUVector[primary, operands...], length(scalars))
+    return _Chain(f(e).ops, DPUArray[primary, operands...], length(scalars))
 end
 
-_chain_of(f, v::DPUVector) = _Chain(f(Internal.input()).ops, DPUVector[v], 0)
+_chain_of(f, v::DPUArray) = _Chain(f(Internal.input()).ops, DPUArray[v], 0)
 _chain_of(f, x::DpuLazy) = _chain_of(f, x.bc)
 _chain_of(f, x) = error("each reduction must be over a DPUVector or a broadcast " *
                         "over one; got a $(typeof(x))")
@@ -128,7 +128,7 @@ end
 _pushes_scalar(op::UInt8) = op == _O.OP_PUSH_SCALAR_VAR ||
     _O.OP_ADD_SCALAR_VAR <= op <= _O.OP_LE_SCALAR_VAR
 
-function _slot!(fused::Vector{DPUVector}, v::DPUVector)
+function _slot!(fused::Vector{DPUArray}, v::DPUArray)
     at = findfirst(x -> x === v, fused)
     at === nothing || return at
     push!(fused, v)
@@ -137,7 +137,7 @@ end
 
 # Rewrite a chain onto the shared input and scalar tables, as push_op_for() and
 # the scalar-slot shift in host/hfuse.cc do.
-function _remap(c::_Chain, fused::Vector{DPUVector}, scalar_base::Int)
+function _remap(c::_Chain, fused::Vector{DPUArray}, scalar_base::Int)
     slots = [_slot!(fused, v) for v in c.inputs]
     out, i = UInt8[], 1
     while i <= length(c.ops)
@@ -161,7 +161,7 @@ function _code_jitted_hfused(cs::Vector{_Chain})
     length(cs) <= MAX_CHAINS || error(
         "$(length(cs)) reductions exceeds MAX_HFUSE_CHAINS ($MAX_CHAINS), so the " *
         "queue splits them across passes")
-    fused, base, chains = DPUVector[], 0, Internal.DpuExpr[]
+    fused, base, chains = DPUArray[], 0, Internal.DpuExpr[]
     for c in cs
         push!(chains, Internal.DpuExpr(_remap(c, fused, base)))
         base += c.nscalars
@@ -172,10 +172,10 @@ function _code_jitted_hfused(cs::Vector{_Chain})
 end
 
 # `sum(abs, a)` / `mapreduce(abs, +, a)`: trace the function, append the terminal.
-_code_jitted_map(terminal, f, v::DPUVector) =
+_code_jitted_map(terminal, f, v::DPUArray) =
     code_jitted(terminal(_trace(f)); nelements = length(v))
 
-function _code_jitted_mapreduce(f, op, v::DPUVector)
+function _code_jitted_mapreduce(f, op, v::DPUArray)
     terminal = get(MAPREDUCE_TERMINALS, op, nothing)
     terminal === nothing && throw(ArgumentError("op must be +, *, min or max"))
     return _code_jitted_map(terminal, f, v)
@@ -199,7 +199,7 @@ function _code_jitted_scatter(statement)
 end
 
 # Whole-vector arg forms are one pair-valued reduction terminal.
-function _code_jitted_arg(name::Symbol, v::DPUVector)
+function _code_jitted_arg(name::Symbol, v::DPUArray)
     terminal = name in (:argmax, :findmax) ? Internal._argmax_terminal :
                                             Internal._argmin_terminal
     return code_jitted(terminal(Internal.input()); nelements = length(v))

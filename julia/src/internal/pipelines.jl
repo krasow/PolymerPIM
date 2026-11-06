@@ -4,7 +4,7 @@
 Queue the reduction identified by `opcode` over `v`. Returns an unread future
 so adjacent independent reductions may fuse before a result is requested.
 """
-function reduce_lazy(v::Parent.DPUVector, opcode::UInt8)
+function reduce_lazy(v::Parent.DPUArray, opcode::UInt8)
     handle = Parent.retry_on_oom(
         () -> Parent.launch_reduction_lazy(v.handle, opcode))
     return Parent.DpuFuture(handle)
@@ -17,31 +17,31 @@ function _check_program(::DpuExpr, operands)
 end
 
 """
-    dpu_pipeline(v, program; operands=DPUVector[], scalars=Int32[]) -> DPUVector
+    dpu_pipeline(v, program; operands=DPUArray[], scalars=Int32[]) -> DPUArray
 
 Run an elementwise RPN `program`. `input()` reads `v`, `operand(i)` reads
 `operands[i]`, and `scalar_var(i)` reads `scalars[i]`. The result remains on the
-DPUs.
+DPUs, shaped as `v`.
 """
 function dpu_pipeline(v, e::DpuExpr;
-                      operands::AbstractVector{Parent.DPUVector} = Parent.DPUVector[],
+                      operands::AbstractVector{<:Parent.DPUArray} = Parent.DPUArray[],
                       scalars::AbstractVector{<:Integer} = Int32[])
     _check_program(e, operands)
     sc = Int32.(collect(scalars))
     handle = Parent.retry_on_oom(() -> Parent.launch_pipeline(
         Parent._force(v).handle, e.ops, Parent._veclist(operands), sc))
-    return Parent.DPUVector(handle)
+    return Parent._like(v, handle)
 end
 
 """
-    dpu_pipeline_reduce(v, program; operands=DPUVector[], scalars=Int32[]) -> DpuFuture
+    dpu_pipeline_reduce(v, program; operands=DPUArray[], scalars=Int32[]) -> DpuFuture
 
 Run an RPN `program` ending in `sum`, `prod`, `minimum`, or `maximum`. Operand
 and scalar slots match [`dpu_pipeline`](@ref). The unread future allows adjacent
 reductions to fuse.
 """
 function dpu_pipeline_reduce(v, e::DpuExpr;
-                             operands::AbstractVector{Parent.DPUVector} = Parent.DPUVector[],
+                             operands::AbstractVector{<:Parent.DPUArray} = Parent.DPUArray[],
                              scalars::AbstractVector{<:Integer} = Int32[])
     _check_program(e, operands)
     isempty(e.ops) && throw(ArgumentError("empty program"))
@@ -57,7 +57,7 @@ end
 # The wrapper transports those bytes as a UInt64 only after the DPU reduction;
 # this is not scalar packing in the kernel.
 function _dpu_argreduce(v, e::DpuExpr;
-                        operands::AbstractVector{Parent.DPUVector} = Parent.DPUVector[],
+                        operands::AbstractVector{<:Parent.DPUArray} = Parent.DPUArray[],
                         scalars::AbstractVector{<:Integer} = Int32[])
     _check_program(e, operands)
     isempty(e.ops) && throw(ArgumentError("empty program"))
@@ -72,7 +72,7 @@ function _dpu_argreduce(v, e::DpuExpr;
 end
 
 """
-    transform(f, v, operands...; scalars=Int32[]) -> DPUVector
+    transform(f, v, operands...; scalars=Int32[]) -> DPUArray
 
 Build and run one elementwise RPN expression. `f` receives the input and
 operand leaves; `scalars` supplies `scalar_var(i)` values.
@@ -82,7 +82,7 @@ function transform(f, v, operands...;
     exprs = DpuExpr[input()]
     append!(exprs, (operand(i) for i in 1:length(operands)))
     return dpu_pipeline(Parent._force(v), f(exprs);
-                        operands = Parent.DPUVector[map(Parent._force, operands)...],
+                        operands = Parent.DPUArray[map(Parent._force, operands)...],
                         scalars = scalars)
 end
 
@@ -96,27 +96,27 @@ function reduce_expr(f, v, operands...;
     exprs = DpuExpr[input()]
     append!(exprs, (operand(i) for i in 1:length(operands)))
     return dpu_pipeline_reduce(Parent._force(v), f(exprs);
-                               operands = Parent.DPUVector[map(Parent._force, operands)...],
+                               operands = Parent.DPUArray[map(Parent._force, operands)...],
                                scalars = scalars)
 end
 
 """
-    dpu_pipeline_multi(v, programs; operands=DPUVector[], scalars=Int32[])
-        -> Vector{DPUVector}
+    dpu_pipeline_multi(v, programs; operands=DPUArray[], scalars=Int32[])
+        -> Vector{DPUArray}
 
 Run independent RPN `programs` in one kernel. All programs share the same input,
 operand, and scalar slots. Returns one device-resident vector per program.
 """
 function dpu_pipeline_multi(
-    v::Parent.DPUVector, chains::AbstractVector{DpuExpr};
-    operands::AbstractVector{Parent.DPUVector} = Parent.DPUVector[],
+    v::Parent.DPUArray, chains::AbstractVector{DpuExpr};
+    operands::AbstractVector{<:Parent.DPUArray} = Parent.DPUArray[],
     scalars::AbstractVector{<:Integer} = Int32[])
     isempty(chains) && throw(ArgumentError("need at least one chain"))
     length(chains) <= Parent.MAX_CHAINS || throw(ArgumentError(
         "$(length(chains)) chains exceeds MAX_HFUSE_CHAINS ($(Parent.MAX_CHAINS))"))
     program = chain(chains...)
     _check_program(program, operands)
-    dests = [Parent.DPUVector(length(v)) for _ in chains]
+    dests = [similar(v) for _ in chains]
     sc = Int32.(collect(scalars))
     Parent.retry_on_oom(() -> Parent.launch_pipeline_multi(
         Parent._veclist(dests), v.handle, program.ops,

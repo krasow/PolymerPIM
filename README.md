@@ -15,6 +15,34 @@ make test PIPELINE=1 JIT=1
 `make` installs the repository-local dependencies on first use. Use
 `BACKEND=simulator` when DPU hardware is unavailable.
 
+### Legion runtime
+
+`RUNTIME=legion` runs the same front end on
+[upmem-legion](https://github.com/PrescienceLab/upmem-legion) instead of the
+UPMEM SDK directly. Vectors become Legion regions partitioned over DPU ranks,
+and the Legion mapper decides where they live.
+
+```bash
+make test RUNTIME=legion PIPELINE=1 JIT=1
+```
+
+The first build clones upmem-legion into `opt/upmem-legion` and builds its
+shared libraries in `legion/`. Legion allocates whole ranks (up to 64 DPUs
+each), so the requested DPU count is rounded up to whole ranks. Pass extra
+Legion flags through `POLYMERPIM_LEGION_ARGS`, for example
+`-ll:dpu_granule 256`.
+
+Rank memory uses upmem-legion's blocked layout (`-ll:dpu_layout blocked`), so
+each DPU holds one contiguous shard of every vector, as with the native
+runtime. Eager mode, fusion and JIT all work, and each rank loads a JIT binary
+only when a launch on it needs one.
+
+Known limitation: nothing moves data between DPUs of one rank, since Legion
+treats a rank as a single memory. Every kernel operand must give a DPU the same
+elements; a mismatch aborts instead of computing wrong results. Intra-rank
+copies are a TODO (see `check_aligned` in
+`host/backends/legion/legion_backend.cc`).
+
 ## C++ API
 
 Include `<polymerpim.h>` and link against `libpolymerpim`:

@@ -5,7 +5,6 @@
 #include <sstream>
 #include <unordered_map>
 
-#include "allocator.h"
 #include "kernelids.h"
 #include "queue.h"
 

@@ -1,9 +1,20 @@
-# REPL display for DPUVector
+# REPL display for DPUArray
 
 const _MAX_DISPLAY_ELEMENTS = 10
 
-function Base.show(io::IO, v::DPUVector)
-    print(io, "DPUVector{Int32}(", v.len, ")")
+_typename(::DPUArray{1}) = "DPUVector{Int32}"
+_typename(::DPUArray{2}) = "DPUMatrix{Int32}"
+_typename(::DPUArray{N}) where {N} = "DPUArray{Int32, $N}"
+
+function Base.show(io::IO, a::DPUArray)
+    print(io, _typename(a), "(", join(size(a), ", "), ")")
+end
+
+# Higher dimensions print as Base prints the host copy, truncated the same way.
+function Base.show(io::IO, ::MIME"text/plain", a::DPUArray)
+    println(io, join(size(a), "×"), " ", _typename(a), ":")
+    a.len == 0 && return
+    Base.print_array(IOContext(io, :limit => true), Array(a))
 end
 
 function Base.show(io::IO, ::MIME"text/plain", v::DPUVector)
@@ -73,6 +84,7 @@ function versioninfo(io::IO = stdout)
 
     println(io, "Library:")
     _field(io, "Backend", cfg("BACKEND"))
+    _field(io, "Device runtime", cfg("DEVICE_RUNTIME", "native"))
     _field(io, "Pipeline/JIT", string("PIPELINE=", cfg("PIPELINE"), " JIT=", cfg("JIT"),
                                       " batch=", cfg("JIT_BATCH_SIZE")))
     _field(io, "Build", string(inst("BUILD_TYPE"), ", ", cfg("CXX_STANDARD"),

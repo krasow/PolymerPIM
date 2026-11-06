@@ -177,13 +177,14 @@ include("jit.jl")
 include("display.jl")
 include("logging.jl")
 include("timing.jl")
+include("tracing.jl")
 
-export DPUVector, DpuFuture, DpuLazy, fence, sync
+export DPUArray, DPUVector, DPUMatrix, DpuFuture, DpuLazy, fence, sync
 export MAX_VFUSE_INPUTS, MAX_PIPELINE_SCALARS, MAX_LOCAL_SCRATCH_VECTORS
 export MAX_CHAINS
 export installinfo, configuration, ndpus, ntasklets
 export code_jitted, @code_jitted, iscompiled
 export withlog, @show_log
-export @dputime
+export @dputime, @trace
 
 end # module PolymerPIM
