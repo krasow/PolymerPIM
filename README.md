@@ -37,6 +37,12 @@ each DPU holds one contiguous shard of every vector, as with the native
 runtime. Eager mode, fusion and JIT all work, and each rank loads a JIT binary
 only when a launch on it needs one.
 
+To profile, set `POLYMERPIM_LEGION_ARGS="-lg:prof 1 -lg:prof_logfile prof_%.gz"`
+and open the result with `legion_prof view prof_0.gz` (`legion_prof trace`
+writes a file for ui.perfetto.dev). `scripts/install_legion_prof.sh` builds
+`legion_prof` into `opt/legion_prof/bin`. `scripts/legion_overlap.py prof_0.gz`
+reports how much rank-to-rank copy time ran while another rank computed.
+
 Known limitation: nothing moves data between DPUs of one rank, since Legion
 treats a rank as a single memory. Every kernel operand must give a DPU the same
 elements; a mismatch aborts instead of computing wrong results. Intra-rank
