@@ -31,6 +31,7 @@ using detail::name_event;
 
 void EventQueue::sync() {
   size_t last_id;
+  bool idle;
   {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
 #if PIPELINE
@@ -40,11 +41,13 @@ void EventQueue::sync() {
     retire_inlined_producers(nullptr);
     compact_fusable_operations();
 #endif
-    if (operations_.empty() && running_events_.empty()) return;
+    idle = operations_.empty() && running_events_.empty();
     last_id = counter_ - 1;
   }
-  process_events(last_id);
+  if (!idle) process_events(last_id);
 
+  // Even when idle: Legion reports completion at issue, so its kernels may
+  // still be running.
   DpuRuntime::get().backend().sync();
   finalize_finished_events();
 }
