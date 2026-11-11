@@ -1,4 +1,4 @@
-// One rank per $POLYMERPIM_RANK_BYTES (32 MiB); placements rotate so
+// One rank per $POLYMERPIM_RANK_BYTES (2 MiB); placements rotate so
 // independent vectors use different ranks.
 
 #include "mapper.h"
@@ -17,7 +17,7 @@ size_t rank_bytes() {
     const long long parsed = std::atoll(value);
     if (parsed > 0) return (size_t)parsed;
   }
-  return size_t{32} << 20;
+  return size_t{2} << 20;
 }
 
 namespace {

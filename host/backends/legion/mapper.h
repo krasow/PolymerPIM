@@ -24,7 +24,7 @@ constexpr Legion::TunableID PLACEMENT_TUNABLE = 0x504d;
 // tag, above the default mapper's bits.
 constexpr unsigned PLACEMENT_TAG_SHIFT = 8;
 
-// Bytes per rank a placement allows ($POLYMERPIM_RANK_BYTES, 32 MiB).
+// Bytes per rank a placement allows ($POLYMERPIM_RANK_BYTES, 2 MiB).
 size_t rank_bytes();
 
 // Installs the mapper on every processor; call before Runtime::start.
