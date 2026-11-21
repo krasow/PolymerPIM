@@ -33,7 +33,9 @@ std::string jit_kernel_source(const Signature& sig);
 // WRAM workspace.  Emitted once per batch as main_<n>.c.
 std::string jit_main_source();
 
-// Where jit_compile() writes its sources, objects and linked binaries.
+// Where jit_compile() writes its sources, objects and linked binaries, and what
+// jit_cleanup() removes: $POLYMERPIM_JIT_DIR/polymerpim-jit-<pid> when the
+// variable is set, otherwise build/jit under the working directory.  Absolute.
 std::string jit_build_dir();
 
 // Returns true if the kernel is found in the specified binary

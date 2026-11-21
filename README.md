@@ -15,6 +15,11 @@ make test PIPELINE=1 JIT=1
 `make` installs the repository-local dependencies on first use. Use
 `BACKEND=simulator` when DPU hardware is unavailable.
 
+JIT-compiled kernels are written to `build/jit` under the working directory
+and removed at `shutdown()`. Set `POLYMERPIM_JIT_DIR` to put them elsewhere:
+each process then uses its own `polymerpim-jit-<pid>` subdirectory and removes
+only that.
+
 ## C++ API
 
 Include `<polymerpim.h>` and link against `libpolymerpim`:
