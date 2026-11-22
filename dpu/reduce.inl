@@ -88,9 +88,6 @@ void print_args(DPU_LAUNCH_ARGS args) {
         }                                                                      \
       }                                                                        \
     }                                                                          \
-    if (is_sum32 && tasklet_id == 0) {                                         \
-      printf("DPU local_red_64: %llx\n", (unsigned long long)local_red_64);    \
-    }                                                                          \
     /* write local result into preceding reserved area (one 8-byte slot per    \
      * tasklet) */                                                             \
     uint64_t *buff_ptr =                                                       \
@@ -119,7 +116,6 @@ void print_args(DPU_LAUNCH_ARGS args) {
             total_64 *= (int64_t)reduction_scratchpad[i];                      \
         }                                                                      \
         *buff_ptr = (uint64_t)total_64;                                        \
-        printf("DPU final total_64: %llx\n", (unsigned long long)total_64);    \
       } else {                                                                 \
         uint32_t total_slots = NR_TASKLETS * stride;                           \
         TYPE res_block_tot[NR_TASKLETS * stride] __attribute__((aligned(8)));  \
