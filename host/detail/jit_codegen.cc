@@ -656,8 +656,10 @@ static void write_kernel_declarations(std::ostream& out, const KernelPlan& plan,
     out << "    " << stack_type << " scalar_vars[" << nscalars << "] = {0};\n";
     for (int k = 0; k < nscalars; ++k) {
       if (!plan.uses_scalar[k]) continue;
-      out << "    scalar_vars[" << k << "] = (" << stack_type
-          << ")args.pipeline.scalars[" << k << "];\n";
+      // Scalars travel as uint32: convert through the element type, so a
+      // negative scalar stays negative on a wider (promoted) stack.
+      out << "    scalar_vars[" << k << "] = (" << stack_type << ")("
+          << type_name << ")args.pipeline.scalars[" << k << "];\n";
     }
     out << "\n";
   }

@@ -22,6 +22,59 @@ TEST(reductions, sum_matches_host) {
   CHECK_EQ(actual, expected);
 }
 
+// Totals far past int32: per-tasklet, per-DPU and cross-DPU sums must all be
+// carried in int64.
+TEST(reductions, sum_promotes_past_int32) {
+#if !ENABLE_PROMOTION_REDUCTIONS
+  SKIP("requires ENABLE_PROMOTION_REDUCTIONS=1");
+#else
+  const size_t n = tf::elements();
+  std::vector<T> a = tf::random_vector<T>(n, 1000000000, 2000000000);
+  dpu_vector<T> da = dpu_vector<T>::from_cpu(a);
+
+  int64_t actual = sum(da).get();
+
+  int64_t expected = 0;
+  for (T x : a) expected += x;
+  CHECK_EQ(actual, expected);
+#endif
+}
+
+// The same through a fused pipeline kernel, whose accumulator is int64 too.
+TEST(reductions, fused_sum_promotes_past_int32) {
+#if !ENABLE_PROMOTION_REDUCTIONS
+  SKIP("requires ENABLE_PROMOTION_REDUCTIONS=1");
+#else
+  const size_t n = tf::elements();
+  std::vector<T> a = tf::random_vector<T>(n, 100000000, 1000000000);
+  dpu_vector<T> da = dpu_vector<T>::from_cpu(a);
+
+  int64_t actual = sum(da * 2).get();
+
+  int64_t expected = 0;
+  for (T x : a) expected += 2 * (int64_t)x;
+  CHECK_EQ(actual, expected);
+#endif
+}
+
+// Scalars reach the DPU as uint32; on a promoted (int64) stack a negative one
+// must still be negative.
+TEST(reductions, fused_sum_with_negative_scalar) {
+#if !ENABLE_PROMOTION_REDUCTIONS
+  SKIP("requires ENABLE_PROMOTION_REDUCTIONS=1");
+#else
+  const size_t n = tf::elements();
+  std::vector<T> a = tf::random_vector<T>(n, 100000000, 700000000);
+  dpu_vector<T> da = dpu_vector<T>::from_cpu(a);
+
+  int64_t actual = sum(da * -3).get();
+
+  int64_t expected = 0;
+  for (T x : a) expected += -3 * (int64_t)x;
+  CHECK_EQ(actual, expected);
+#endif
+}
+
 TEST(reductions, min_matches_host) {
   const size_t n = tf::elements();
   std::vector<T> a = tf::random_vector<T>(n, -1000, 1000);
