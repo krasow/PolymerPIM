@@ -284,13 +284,27 @@ typename dpu_vector<T>::reduction_result_t reduction_cpu(dpu_vector<T>& da,
   auto& runtime = DpuRuntime::get();
   assert(a.size() % runtime.num_dpus() == 0);
   size_t stride = a.size() / runtime.num_dpus();
+  using result_t = typename dpu_vector<T>::reduction_result_t;
+  auto op = kernel_infos[kernel_id].op;
+  // A promoted sum or product leaves each DPU's partial as a result_t spanning
+  // several T slots; min and max leave a T.
+  const bool promoted = sizeof(result_t) > sizeof(T) &&
+                        (op == KERNEL_OP_SUM || op == KERNEL_OP_PRODUCT);
+  assert(!promoted || stride * sizeof(T) >= sizeof(result_t));
+  auto partial = [&](size_t i) -> result_t {
+    if (promoted) {
+      result_t value;
+      std::memcpy(&value, &a[i], sizeof(result_t));
+      return value;
+    }
+    return a[i];
+  };
   // initialize accumulator with the first partial result
-  typename dpu_vector<T>::reduction_result_t acc = a[0];
+  result_t acc = partial(0);
 
   // reduce over the remaining DPUs
-  auto op = kernel_infos[kernel_id].op;
   for (size_t i = stride; i < a.size(); i += stride) {
-    typename dpu_vector<T>::reduction_result_t x = a[i];
+    result_t x = partial(i);
     switch (op) {
       case KERNEL_OP_SUM:
         acc += x;
@@ -839,7 +853,9 @@ dpu_vector<T> abs(const dpu_vector<T>& a) {
 template <typename T>
 lazy_reduction_result<T> sum(const dpu_vector<T>& a) {
   auto& runtime = DpuRuntime::get();
-  dpu_vector<T> buf(runtime.num_dpus(),
+  // 8 bytes per DPU, like pipeline_reduce: a promoted partial is an int64.
+  size_t elems_per_dpu = (8 + sizeof(T) - 1) / sizeof(T);
+  dpu_vector<T> buf(runtime.num_dpus() * elems_per_dpu,
                     runtime.num_tasklets() * sizeof(size_t));
   buf.data_desc_ref()->type_name = typeid(T).name();
   buf.data_desc_ref()->debug_name = "reduction_buffer";
@@ -854,7 +870,9 @@ lazy_reduction_result<T> sum(const dpu_vector<T>& a) {
 template <typename T>
 lazy_reduction_result<T> product(const dpu_vector<T>& a) {
   auto& runtime = DpuRuntime::get();
-  dpu_vector<T> buf(runtime.num_dpus(),
+  // 8 bytes per DPU, like pipeline_reduce: a promoted partial is an int64.
+  size_t elems_per_dpu = (8 + sizeof(T) - 1) / sizeof(T);
+  dpu_vector<T> buf(runtime.num_dpus() * elems_per_dpu,
                     runtime.num_tasklets() * sizeof(size_t));
   buf.data_desc_ref()->type_name = typeid(T).name();
   buf.data_desc_ref()->debug_name = "reduction_buffer";
