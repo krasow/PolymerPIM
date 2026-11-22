@@ -19,6 +19,7 @@
 #include <queue.h>
 #include <runtime.h>
 #include <stats.h>
+#include <unistd.h>
 
 #include <algorithm>
 #if JIT_PIPELINE_FALLBACK
@@ -447,7 +448,25 @@ bool jit_find_kernel_in_binary(const Signature& sig,
   return false;
 }
 
-std::string jit_build_dir() { return "build/jit"; }
+// $POLYMERPIM_JIT_DIR, when set, gets a per-process subdirectory: cleanup then
+// removes only this process's files, never the directory the user named, and
+// processes sharing it don't overwrite each other's kernels.  Otherwise
+// build/jit under the working directory.  Resolved to an absolute path once,
+// so a later chdir can't send cleanup somewhere other than where we compiled.
+// Never destroyed: shutdown() may run from an atexit handler registered before
+// this first call, and static objects are destroyed before such handlers run.
+std::string jit_build_dir() {
+  static const std::string* const dir = new std::string([] {
+    const char* base = std::getenv("POLYMERPIM_JIT_DIR");
+    if (base != nullptr && base[0] != '\0') {
+      return (fs::absolute(base) /
+              ("polymerpim-jit-" + std::to_string(getpid())))
+          .string();
+    }
+    return fs::absolute("build/jit").string();
+  }());
+  return *dir;
+}
 
 // Rendering the source without compiling it: what @code_jitted shows in Julia.
 std::string jit_kernel_source(const Signature& sig) {
